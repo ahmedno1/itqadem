@@ -1,0 +1,22 @@
+{
+  "name": "atqadam-web-game",
+  "version": "1.0.0",
+  "description": "Game web app prototype for the 'أتقدم للوظيفة' project",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "keywords": [
+    "game",
+    "express",
+    "socket.io",
+    "web"
+  ],
+  "author": "Copilot",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^5.2.1",
+    "socket.io": "^4.8.4"
+  }
+}
