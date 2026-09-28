@@ -69,6 +69,13 @@ function getRole(room, socket) {
   return null;
 }
 
+function stopVoiceSpeaking(room, socketId) {
+  const speaker = room.voiceSpeakers.get(socketId);
+  if (!speaker) return;
+  room.voiceSpeakers.delete(socketId);
+  io.to(room.roomId).emit('voiceSpeaking', { ...speaker, active: false });
+}
+
 function publicRoomState(room, socket) {
   const role = getRole(room, socket);
   const me = room.players.find((player) => player.socketId === socket.id) || null;
@@ -93,7 +100,7 @@ function publicRoomState(room, socket) {
     currentQuestion: room.currentQuestion,
     round: room.round,
     turnIndex: room.turnIndex,
-    currentSpeaker: speakerPlayer ? { id: speakerPlayer.id, name: speakerPlayer.name } : null,
+    currentSpeaker: speakerPlayer ? { id: speakerPlayer.id, name: speakerPlayer.name, socketId: speakerPlayer.socketId } : null,
     turnEndsAt: room.turnEndsAt,
     trapRevealed: room.trapRevealed,
     revealedTrap: room.trapRevealed ? room.assignedTraps.get(speaker) || '' : '',
@@ -103,6 +110,14 @@ function publicRoomState(room, socket) {
     finalDefense: room.finalDefense,
     finalDecision: room.finalDecision,
     eliminatedPlayerId: room.eliminatedPlayerId,
+    voicePeers: [
+      ...(room.bossConnected ? [{ socketId: room.bossId, name: room.bossName, role: 'boss' }] : []),
+      ...room.players
+        .filter((player) => player.isConnected && player.socketId)
+        .map((player) => ({ socketId: player.socketId, name: player.name, role: 'player' }))
+    ],
+    voiceSpeakers: Array.from(room.voiceSpeakers.values()),
+    chatMessages: room.chatMessages.slice(-50),
     role,
     meId: me?.id || (role === 'boss' ? room.bossId : null),
     isMyTurn: Boolean(me && speaker === me.id),
@@ -300,6 +315,8 @@ io.on('connection', (socket) => {
       finalDefense: '',
       finalDecision: null,
       eliminatedPlayerId: null,
+      chatMessages: [],
+      voiceSpeakers: new Map(),
       timer: null,
       cleanupTimer: null
     };
@@ -414,6 +431,88 @@ io.on('connection', (socket) => {
     tryStartDefense(room);
   });
 
+  socket.on('sendChatMessage', (payload = {}, callback) => {
+    const room = getRoomForSocket(socket);
+    const role = room && getRole(room, socket);
+    const player = room && getPlayerBySocket(room, socket.id);
+    const text = typeof payload.text === 'string' ? payload.text.trim() : '';
+    if (!room || !role) return sendError(socket, callback, 'انضم إلى الغرفة لإرسال رسالة.');
+    if (!validateText(text, 300)) return sendError(socket, callback, 'اكتب رسالة من 1 إلى 300 حرف.');
+    const now = Date.now();
+    if (now - (socket.data.lastChatAt || 0) < 500) return sendError(socket, callback, 'انتظر لحظة قبل إرسال رسالة أخرى.');
+
+    socket.data.lastChatAt = now;
+    const message = {
+      id: crypto.randomUUID(),
+      name: role === 'boss' ? room.bossName : player.name,
+      text,
+      sentAt: now
+    };
+    room.chatMessages.push(message);
+    room.chatMessages = room.chatMessages.slice(-50);
+    io.to(room.roomId).emit('chatMessage', message);
+    if (typeof callback === 'function') callback({ ok: true });
+  });
+
+  socket.on('sendReaction', (payload = {}, callback) => {
+    const room = getRoomForSocket(socket);
+    const role = room && getRole(room, socket);
+    const player = room && getPlayerBySocket(room, socket.id);
+    const allowedReactions = ['👏', '😂', '🔥', '💯', '❤️', '😮'];
+    if (!room || !role) return sendError(socket, callback, 'انضم إلى الغرفة لإرسال تفاعل.');
+    if (room.status !== 'DEFENSE') return sendError(socket, callback, 'التفاعلات متاحة أثناء مرحلة التبرير فقط.');
+    if (!allowedReactions.includes(payload.emoji)) return sendError(socket, callback, 'هذا التفاعل غير متاح.');
+
+    io.to(room.roomId).emit('reaction', {
+      emoji: payload.emoji,
+      name: role === 'boss' ? room.bossName : player.name,
+      sentAt: Date.now()
+    });
+    if (typeof callback === 'function') callback({ ok: true });
+  });
+
+  socket.on('voiceSignal', (payload = {}, callback) => {
+    const room = getRoomForSocket(socket);
+    const targetSocketId = payload.targetSocketId;
+    const signal = payload.signal;
+    const roomSocketIds = room && io.sockets.adapter.rooms.get(room.roomId);
+    if (!room || !getRole(room, socket) || typeof targetSocketId !== 'string' || !roomSocketIds?.has(targetSocketId)) {
+      return sendError(socket, callback, 'تعذر إنشاء الاتصال الصوتي داخل هذه الغرفة.');
+    }
+
+    const isDescription = signal?.type === 'description'
+      && ['offer', 'answer'].includes(signal.description?.type)
+      && typeof signal.description.sdp === 'string'
+      && signal.description.sdp.length <= 16000;
+    const isCandidate = signal?.type === 'candidate'
+      && signal.candidate
+      && typeof signal.candidate.candidate === 'string'
+      && signal.candidate.candidate.length <= 2000;
+    if (!isDescription && !isCandidate) return sendError(socket, callback, 'بيانات الاتصال الصوتي غير صالحة.');
+
+    io.to(targetSocketId).emit('voiceSignal', { from: socket.id, signal });
+    if (typeof callback === 'function') callback({ ok: true });
+  });
+
+  socket.on('voiceSpeaking', (payload = {}, callback) => {
+    const room = getRoomForSocket(socket);
+    const role = room && getRole(room, socket);
+    const player = room && getPlayerBySocket(room, socket.id);
+    if (!room || !role) return sendError(socket, callback, 'انضم إلى الغرفة لإظهار حالة التحدث.');
+
+    if (payload.active === true) {
+      const speaker = {
+        socketId: socket.id,
+        name: role === 'boss' ? room.bossName : player.name
+      };
+      room.voiceSpeakers.set(socket.id, speaker);
+      io.to(room.roomId).emit('voiceSpeaking', { ...speaker, active: true });
+    } else {
+      stopVoiceSpeaking(room, socket.id);
+    }
+    if (typeof callback === 'function') callback({ ok: true });
+  });
+
   socket.on('revealTrap', (payload, callback) => {
     const room = getRoomForSocket(socket);
     const player = room && getPlayerBySocket(room, socket.id);
@@ -526,6 +625,7 @@ io.on('connection', (socket) => {
   socket.on('leaveRoom', (payload, callback) => {
     const room = getRoomForSocket(socket);
     if (room) {
+      stopVoiceSpeaking(room, socket.id);
       if (room.bossId === socket.id) {
         room.bossConnected = false;
       } else {
@@ -548,6 +648,7 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => {
     const room = getRoomForSocket(socket);
     if (!room) return;
+    stopVoiceSpeaking(room, socket.id);
     if (room.bossId === socket.id) {
       room.bossConnected = false;
     } else {

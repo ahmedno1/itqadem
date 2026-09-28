@@ -2,6 +2,7 @@ const socket = io();
 const app = document.getElementById('app');
 const topBarActions = document.getElementById('top-bar-actions');
 const ONLINE_SESSION_KEY = 'atqadam-online-session-v1';
+const EMOJI_USAGE_KEY = 'atqadam-emoji-usage-v1';
 
 let onlineSession = null;
 let onlineState = null;
@@ -11,6 +12,31 @@ let onlineCountdownTimer = null;
 let onlineConnectionStatus = 'connected';
 let onlineAudioContext = null;
 let onlineServerOffset = 0;
+let onlineChatOpen = false;
+let onlineChatMessages = [];
+let onlineVoiceSpeakers = new Map();
+let emojiCatalog = [];
+let stickerCatalog = [];
+let emojiUsage = {};
+let recentEmojis = [];
+let emojiSortMode = 'groups';
+let emojiSelectedGroup = 'all';
+let emojiShowAll = false;
+let emojiPickerOpen = false;
+let stickerPickerOpen = false;
+let voiceConnections = new Map();
+let localVoiceStream = null;
+let voiceStreamRequest = null;
+let voicePressed = false;
+let onlineSpeakingSent = false;
+
+try {
+  const emojiUsageState = JSON.parse(localStorage.getItem(EMOJI_USAGE_KEY) || '{}');
+  emojiUsage = emojiUsageState.counts && typeof emojiUsageState.counts === 'object' ? emojiUsageState.counts : {};
+  recentEmojis = Array.isArray(emojiUsageState.recent) ? emojiUsageState.recent : [];
+} catch (error) {
+  localStorage.removeItem(EMOJI_USAGE_KEY);
+}
 
 try {
   onlineSession = JSON.parse(localStorage.getItem(ONLINE_SESSION_KEY) || 'null');
@@ -400,6 +426,315 @@ function onlineHeader(state) {
   </div>`;
 }
 
+function chatMessageMarkup(message) {
+  const sticker = stickerCatalog.find((entry) => entry.emoji === message.text.trim());
+  if (sticker) {
+    return `<li class="online-chat-message is-sticker"><strong>${escapeHtml(message.name)}</strong><img class="chat-sticker" src="${escapeHtml(sticker.src)}" alt="${escapeHtml(sticker.alt || sticker.name)}" title="${escapeHtml(sticker.name)}" /></li>`;
+  }
+
+  let text = escapeHtml(message.text);
+  stickerCatalog.filter((entry) => entry.emoji && entry.src).forEach((entry) => {
+    const image = `<img class="chat-inline-emoji" src="${escapeHtml(entry.src)}" alt="${escapeHtml(entry.alt || entry.name)}" title="${escapeHtml(entry.name)}" />`;
+    text = text.split(escapeHtml(entry.emoji)).join(image);
+  });
+  return `<li class="online-chat-message"><strong>${escapeHtml(message.name)}</strong><span>${text}</span></li>`;
+}
+
+function sortedEmojiCatalog() {
+  const recentOrder = new Map(recentEmojis.map((emoji, index) => [emoji, index]));
+  return emojiCatalog.filter((entry) => emojiSelectedGroup === 'all' || entry.category === emojiSelectedGroup).sort((first, second) => {
+    if (emojiSortMode === 'groups') return first.index - second.index;
+    if (emojiSortMode === 'recent') {
+      const firstRecent = recentOrder.get(first.emoji) ?? Number.MAX_SAFE_INTEGER;
+      const secondRecent = recentOrder.get(second.emoji) ?? Number.MAX_SAFE_INTEGER;
+      return firstRecent - secondRecent || first.index - second.index;
+    }
+    return (emojiUsage[second.emoji] || 0) - (emojiUsage[first.emoji] || 0) || first.index - second.index;
+  });
+}
+
+function saveEmojiUsage() {
+  try {
+    localStorage.setItem(EMOJI_USAGE_KEY, JSON.stringify({ counts: emojiUsage, recent: recentEmojis }));
+  } catch (error) {
+    console.warn('Unable to save emoji usage:', error);
+  }
+}
+
+function recordEmojiUsage(emoji) {
+  emojiUsage[emoji] = (emojiUsage[emoji] || 0) + 1;
+  recentEmojis = [emoji, ...recentEmojis.filter((entry) => entry !== emoji)].slice(0, 40);
+  saveEmojiUsage();
+  if (emojiPickerOpen) renderEmojiPicker();
+}
+
+function renderEmojiPicker() {
+  const picker = document.querySelector('[data-emoji-picker]');
+  if (!picker) return;
+  picker.hidden = !emojiPickerOpen;
+  if (!emojiPickerOpen) return;
+
+  const sorted = sortedEmojiCatalog();
+  const visible = emojiShowAll ? sorted : sorted.slice(0, 28);
+  const groups = [...new Set(emojiCatalog.map((entry) => entry.category))];
+  picker.innerHTML = `<label class="emoji-group-filter"><span>المجموعة</span><select data-action="emoji-category" aria-label="اختيار مجموعة الإيموجي">
+      <option value="all" ${emojiSelectedGroup === 'all' ? 'selected' : ''}>كل المجموعات</option>
+      ${groups.map((group) => `<option value="${escapeHtml(group)}" ${emojiSelectedGroup === group ? 'selected' : ''}>${escapeHtml(group)}</option>`).join('')}
+    </select></label>
+    <div class="emoji-sort-controls" role="group" aria-label="ترتيب الإيموجي">
+      <button type="button" data-action="emoji-sort" data-sort="groups" aria-pressed="${emojiSortMode === 'groups'}">حسب المجموعة</button>
+      <button type="button" data-action="emoji-sort" data-sort="popular" aria-pressed="${emojiSortMode === 'popular'}">الأكثر استخداماً</button>
+      <button type="button" data-action="emoji-sort" data-sort="recent" aria-pressed="${emojiSortMode === 'recent'}">الأخيرة</button>
+    </div>
+    <div class="emoji-picker-grid">${visible.map((entry) => `<button type="button" data-action="chat-emoji-select" data-emoji="${escapeHtml(entry.emoji)}" aria-label="إدراج ${escapeHtml(entry.emoji)}" title="${escapeHtml(entry.emoji)}">${escapeHtml(entry.emoji)}</button>`).join('')}</div>
+    ${sorted.length > visible.length ? `<button type="button" class="emoji-show-more" data-action="emoji-show-all">عرض باقي الإيموجي (${sorted.length - visible.length})</button>` : ''}`;
+}
+
+function renderStickerPicker() {
+  const picker = document.querySelector('[data-sticker-picker]');
+  if (!picker) return;
+  picker.hidden = !stickerPickerOpen;
+  if (!stickerPickerOpen) return;
+  picker.innerHTML = stickerCatalog.length
+    ? `<div class="sticker-picker-grid">${stickerCatalog.map((sticker) => `<button type="button" data-action="chat-sticker-send" data-sticker-token="${escapeHtml(sticker.emoji)}" aria-label="إرسال ملصق ${escapeHtml(sticker.name || sticker.emoji)}" title="${escapeHtml(sticker.name || sticker.emoji)}"><img src="${escapeHtml(sticker.src)}" alt="${escapeHtml(sticker.alt || sticker.name)}" /><span>${escapeHtml(sticker.name || sticker.emoji)}</span></button>`).join('')}</div>`
+    : '<p class="sticker-picker-empty">لا توجد ملصقات مخصصة في الكتالوج.</p>';
+}
+
+async function loadEmojiCatalog() {
+  try {
+    const response = await fetch('/emoji-catalog.json');
+    if (!response.ok) throw new Error('Emoji catalog request failed');
+    const catalog = await response.json();
+    emojiCatalog = (catalog.groups || []).flatMap((group) => (group.emojis || []).map((emoji) => ({
+      emoji,
+      category: group.name,
+      index: 0
+    })));
+    stickerCatalog = (catalog.groups || []).flatMap((group) => (group.customEmojis || [])
+      .filter((entry) => typeof entry.token === 'string' && typeof entry.src === 'string')
+      .map((entry) => ({
+        emoji: entry.token,
+        category: group.name,
+        src: entry.src,
+        alt: entry.alt,
+        name: entry.name
+      })));
+    emojiCatalog.forEach((entry, index) => { entry.index = index; });
+    renderEmojiPicker();
+    renderStickerPicker();
+    const messageList = document.querySelector('.online-chat-messages');
+    if (messageList) {
+      messageList.innerHTML = onlineChatMessages.map(chatMessageMarkup).join('');
+      messageList.scrollTop = messageList.scrollHeight;
+    }
+  } catch (error) {
+    console.warn('Unable to load the emoji catalog:', error);
+  }
+}
+
+function voiceSpeakerBadge(speaker) {
+  if (!speaker) return '';
+  const initial = Array.from(speaker.name || '?')[0];
+  const isSpeaking = onlineVoiceSpeakers.has(speaker.socketId);
+  return `<div class="online-current-speaker${isSpeaking ? ' is-speaking' : ''}" data-speaker-socket-id="${escapeHtml(speaker.socketId || '')}" aria-label="المتحدث الآن: ${escapeHtml(speaker.name)}">
+    <span class="online-speaker-avatar">${escapeHtml(initial)}</span>
+    <span class="online-speaker-copy"><strong>المتحدث الآن</strong><span>${escapeHtml(speaker.name)}</span></span>
+    <span class="voice-wave" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
+  </div>`;
+}
+
+function activeVoiceSpeakersMarkup() {
+  const speakers = [...onlineVoiceSpeakers.values()];
+  return `<div class="online-active-speakers" data-online-active-speakers ${speakers.length ? '' : 'hidden'} aria-live="polite">
+    ${speakers.map((speaker) => `<span class="online-active-speaker"><span class="online-speaker-avatar">${escapeHtml(Array.from(speaker.name || '?')[0])}</span><strong>${escapeHtml(speaker.name)}</strong><span class="voice-wave" aria-hidden="true"><i></i><i></i><i></i></span></span>`).join('')}
+  </div>`;
+}
+
+function updateVoiceSpeakerIndicators() {
+  const container = document.querySelector('[data-online-active-speakers]');
+  if (container) {
+    container.outerHTML = activeVoiceSpeakersMarkup();
+  }
+  document.querySelectorAll('[data-speaker-socket-id]').forEach((indicator) => {
+    indicator.classList.toggle('is-speaking', onlineVoiceSpeakers.has(indicator.dataset.speakerSocketId));
+  });
+}
+
+function onlineSocialTools(state) {
+  const messages = Array.isArray(state.chatMessages) ? state.chatMessages : onlineChatMessages;
+  onlineChatMessages = messages.slice(-50);
+  const canTalk = onlineConnectionStatus === 'connected';
+  const reactions = ['👏', '😂', '🔥', '💯', '❤️', '😮'];
+
+  return `<div class="online-social-tools">
+    <div class="online-social-actions">
+      <button class="secondary-btn online-chat-toggle" type="button" data-action="online-chat-toggle" aria-expanded="${onlineChatOpen}">
+        المحادثة <span class="chat-count">${onlineChatMessages.length}</span>
+      </button>
+      ${state.status === 'DEFENSE'
+        ? `<div class="online-reactions" aria-label="تفاعلات سريعة">${reactions.map((emoji) => `<button type="button" class="reaction-btn" data-action="online-reaction" data-emoji="${emoji}" aria-label="إرسال ${emoji}">${emoji}</button>`).join('')}</div>`
+        : ''}
+      ${canTalk
+        ? `<button class="push-to-talk${voicePressed ? ' is-pressed' : ''}" type="button" data-action="online-ptt" aria-pressed="${voicePressed}">اضغط للتحدث</button>`
+        : ''}
+    </div>
+    ${activeVoiceSpeakersMarkup()}
+    <section class="online-chat-drawer${onlineChatOpen ? ' is-open' : ''}" aria-label="محادثة الغرفة" aria-hidden="${!onlineChatOpen}">
+      <header class="online-chat-header"><strong>محادثة الغرفة</strong><button type="button" data-action="online-chat-close" aria-label="إغلاق المحادثة">×</button></header>
+      <ol class="online-chat-messages" aria-live="polite">${onlineChatMessages.map(chatMessageMarkup).join('')}</ol>
+      <form class="online-chat-form" data-online-form="chat">
+        <input name="message" type="text" maxlength="300" autocomplete="off" placeholder="اكتب رسالة..." aria-label="رسالة جديدة" required />
+        <button class="chat-emoji-toggle" type="button" data-action="chat-emoji-toggle" aria-label="عرض الإيموجي" aria-expanded="${emojiPickerOpen}">😀</button>
+        <button class="chat-sticker-toggle" type="button" data-action="chat-sticker-toggle" aria-label="عرض الملصقات" aria-expanded="${stickerPickerOpen}">🖼️</button>
+        <button type="submit" aria-label="إرسال الرسالة">إرسال</button>
+      </form>
+      <div class="emoji-picker" data-emoji-picker ${emojiPickerOpen ? '' : 'hidden'}></div>
+      <div class="sticker-picker" data-sticker-picker ${stickerPickerOpen ? '' : 'hidden'}></div>
+    </section>
+  </div><div class="online-reaction-layer" aria-live="polite"></div>`;
+}
+
+function closeVoiceConnection(peerSocketId, peer) {
+  peer.connection.ontrack = null;
+  peer.connection.onicecandidate = null;
+  peer.connection.onnegotiationneeded = null;
+  peer.connection.close();
+  peer.remoteAudio?.remove();
+  voiceConnections.delete(peerSocketId);
+}
+
+function sendVoiceSignal(targetSocketId, signal) {
+  socket.emit('voiceSignal', { targetSocketId, signal });
+}
+
+function createVoiceConnection(peerInfo) {
+  const connection = new RTCPeerConnection({
+    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+  });
+  const peer = {
+    connection,
+    makingOffer: false,
+    ignoreOffer: false,
+    settingRemoteAnswer: false,
+    pendingCandidates: [],
+    polite: socket.id.localeCompare(peerInfo.socketId) > 0,
+    remoteAudio: null
+  };
+  voiceConnections.set(peerInfo.socketId, peer);
+
+  connection.onicecandidate = (event) => {
+    if (event.candidate) sendVoiceSignal(peerInfo.socketId, { type: 'candidate', candidate: event.candidate.toJSON() });
+  };
+  connection.onnegotiationneeded = async () => {
+    try {
+      peer.makingOffer = true;
+      await connection.setLocalDescription();
+      sendVoiceSignal(peerInfo.socketId, { type: 'description', description: connection.localDescription.toJSON() });
+    } catch (error) {
+      console.warn('Unable to negotiate the voice connection:', error);
+    } finally {
+      peer.makingOffer = false;
+    }
+  };
+  connection.ontrack = (event) => {
+    if (!peer.remoteAudio) {
+      peer.remoteAudio = document.createElement('audio');
+      peer.remoteAudio.autoplay = true;
+      peer.remoteAudio.playsInline = true;
+      peer.remoteAudio.dataset.voicePeer = peerInfo.socketId;
+      document.body.appendChild(peer.remoteAudio);
+    }
+    peer.remoteAudio.srcObject = event.streams[0];
+    peer.remoteAudio.play().catch(() => {});
+  };
+
+  if (localVoiceStream) {
+    localVoiceStream.getAudioTracks().forEach((track) => connection.addTrack(track, localVoiceStream));
+  }
+  return peer;
+}
+
+function syncVoiceConnections(state) {
+  const peers = Array.isArray(state.voicePeers) ? state.voicePeers : [];
+  const activePeerIds = new Set(peers.map((peer) => peer.socketId).filter((id) => id && id !== socket.id));
+  for (const [peerSocketId, peer] of voiceConnections) {
+    if (!activePeerIds.has(peerSocketId)) closeVoiceConnection(peerSocketId, peer);
+  }
+  if (typeof RTCPeerConnection === 'undefined') return;
+  peers.forEach((peerInfo) => {
+    if (peerInfo.socketId !== socket.id && !voiceConnections.has(peerInfo.socketId)) createVoiceConnection(peerInfo);
+  });
+  if (!canUsePushToTalk(state)) {
+    voicePressed = false;
+    setVoiceTrackEnabled(false);
+  }
+}
+
+function canUsePushToTalk(state = onlineState) {
+  return Boolean(state && onlineSession && onlineConnectionStatus === 'connected');
+}
+
+function setVoiceTrackEnabled(enabled) {
+  if (localVoiceStream) {
+    localVoiceStream.getAudioTracks().forEach((track) => { track.enabled = enabled; });
+  }
+  document.querySelectorAll('[data-action="online-ptt"]').forEach((button) => {
+    button.classList.toggle('is-pressed', enabled);
+    button.setAttribute('aria-pressed', String(enabled));
+    button.textContent = enabled ? 'تتحدث الآن...' : 'اضغط للتحدث';
+  });
+  if (!enabled && !socket.connected) onlineSpeakingSent = false;
+  if (socket.connected && onlineSession && enabled !== onlineSpeakingSent && (!enabled || localVoiceStream)) {
+    socket.emit('voiceSpeaking', { active: enabled });
+    onlineSpeakingSent = enabled;
+  }
+}
+
+async function startPushToTalk() {
+  if (!canUsePushToTalk()) return;
+  if (!navigator.mediaDevices?.getUserMedia) {
+    setOnlineMessage('المتصفح لا يدعم استخدام الميكروفون في هذه الصفحة.');
+    return;
+  }
+  voicePressed = true;
+  setVoiceTrackEnabled(true);
+  try {
+    if (!localVoiceStream) {
+      voiceStreamRequest ||= navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        video: false
+      });
+      localVoiceStream = await voiceStreamRequest;
+      voiceStreamRequest = null;
+      localVoiceStream.getAudioTracks().forEach((track) => { track.enabled = voicePressed && canUsePushToTalk(); });
+      voiceConnections.forEach((peer) => {
+        localVoiceStream.getAudioTracks().forEach((track) => {
+          if (!peer.connection.getSenders().some((sender) => sender.track === track)) peer.connection.addTrack(track, localVoiceStream);
+        });
+      });
+    }
+    setVoiceTrackEnabled(voicePressed && canUsePushToTalk());
+  } catch (error) {
+    voiceStreamRequest = null;
+    voicePressed = false;
+    setVoiceTrackEnabled(false);
+    setOnlineMessage('تعذر تشغيل الميكروفون. تحقق من الإذن واستخدام اتصال آمن.');
+  }
+}
+
+function stopPushToTalk() {
+  voicePressed = false;
+  setVoiceTrackEnabled(false);
+}
+
+function closeVoiceConnections() {
+  voiceConnections.forEach((peer, peerSocketId) => closeVoiceConnection(peerSocketId, peer));
+  if (localVoiceStream) localVoiceStream.getTracks().forEach((track) => track.stop());
+  localVoiceStream = null;
+  voiceStreamRequest = null;
+  voicePressed = false;
+}
+
 function renderOnlineRoom() {
   if (!onlineSession || !onlineState) return;
   if (Number.isFinite(onlineState.serverNow)) {
@@ -445,14 +780,14 @@ function renderOnlineRoom() {
     const count = state.turnEndsAt ? Math.max(0, Math.ceil((state.turnEndsAt - (Date.now() + onlineServerOffset)) / 1000)) : 0;
     if (state.isMyTurn) {
       screen = `${onlineHeader(state)}<span class="status-pill">دورك في التبرير</span>
-        <h2>${escapeHtml(currentSpeaker)}</h2><div class="timer-box"><span data-online-countdown>${count}</span><span>ث</span></div>
+        <h2>${escapeHtml(currentSpeaker)}</h2>${voiceSpeakerBadge(state.currentSpeaker)}<div class="timer-box"><span data-online-countdown>${count}</span><span>ث</span></div>
         <div class="trap-card-wrap"><div class="trap-card ${state.trapRevealed ? 'is-flipped' : ''}" data-action="online-reveal" role="button" tabindex="0" aria-label="كشف الإجابة التوريطية">
           <div class="card-face card-front">${state.trapRevealed ? 'الإجابة المكشوفة' : 'بطاقتك مغلقة'}</div><div class="card-face card-back">${escapeHtml(state.myTrap || 'لا توجد إجابة مخصصة.')}</div>
         </div></div>
         ${state.trapRevealed ? '<button class="game-btn" type="button" data-action="online-finish-defense">أنهيت التبرير</button>' : '<button class="secondary-btn" type="button" data-action="online-reveal">اكشف البطاقة</button>'}`;
     } else {
       screen = `${onlineHeader(state)}<span class="status-pill">بث مباشر للتبرير</span>
-        <h2>المتحدث الآن: ${escapeHtml(currentSpeaker)}</h2><div class="timer-box"><span data-online-countdown>${count}</span><span>ث</span></div>
+        <h2>المتحدث الآن: ${escapeHtml(currentSpeaker)}</h2>${voiceSpeakerBadge(state.currentSpeaker)}<div class="timer-box"><span data-online-countdown>${count}</span><span>ث</span></div>
         <div class="info-box"><p>سؤال المدير</p><strong>${escapeHtml(state.currentQuestion)}</strong></div>
         <div class="live-answer">${state.trapRevealed ? `<span>الإجابة التوريطية</span><strong>${escapeHtml(state.revealedTrap || '—')}</strong>` : '<span>البطاقة ما زالت مغلقة</span>'}</div>`;
     }
@@ -485,7 +820,10 @@ function renderOnlineRoom() {
     screen = `${onlineHeader(state)}<span class="status-pill">التحدي النهائي</span><h2>المتقدم الأخير: ${escapeHtml(finalist?.name || '—')}</h2>${finalQuestionPanel}${finalAction}`;
   }
 
-  app.innerHTML = `<section class="screen-card online-room-screen">${screen}${onlineMessage ? `<div class="online-message">${escapeHtml(onlineMessage)}</div>` : ''}</section>`;
+  app.innerHTML = `<section class="screen-card online-room-screen">${screen}<div id="online-message" class="online-message" ${onlineMessage ? '' : 'hidden'}>${escapeHtml(onlineMessage)}</div>${onlineSocialTools(state)}</section>`;
+  renderEmojiPicker();
+  renderStickerPicker();
+  syncVoiceConnections(state);
   startOnlineCountdown(state.turnEndsAt);
 }
 
@@ -506,6 +844,7 @@ function startOnlineCountdown(turnEndsAt) {
 
 function leaveOnlineRoom() {
   emitOnlineEvent('leaveRoom').finally(() => {
+    closeVoiceConnections();
     localStorage.removeItem(ONLINE_SESSION_KEY);
     onlineSession = null;
     onlineState = null;
@@ -1328,6 +1667,65 @@ function handleGameAction(event) {
     case 'online-final-decision':
       emitOnlineEvent('finalDecision', { decision: button.dataset.decision });
       break;
+    case 'online-chat-toggle':
+      onlineChatOpen = !onlineChatOpen;
+      renderOnlineRoom();
+      if (onlineChatOpen) document.querySelector('.online-chat-form input')?.focus();
+      break;
+    case 'online-chat-close':
+      onlineChatOpen = false;
+      renderOnlineRoom();
+      break;
+    case 'online-reaction':
+      recordEmojiUsage(button.dataset.emoji);
+      emitOnlineEvent('sendReaction', { emoji: button.dataset.emoji });
+      break;
+    case 'chat-emoji-toggle':
+      emojiPickerOpen = !emojiPickerOpen;
+      if (emojiPickerOpen) {
+        stickerPickerOpen = false;
+        document.querySelector('.chat-sticker-toggle')?.setAttribute('aria-expanded', 'false');
+      }
+      button.setAttribute('aria-expanded', String(emojiPickerOpen));
+      renderEmojiPicker();
+      renderStickerPicker();
+      break;
+    case 'emoji-sort':
+      emojiSortMode = ['recent', 'popular'].includes(button.dataset.sort) ? button.dataset.sort : 'groups';
+      renderEmojiPicker();
+      break;
+    case 'emoji-show-all':
+      emojiShowAll = true;
+      renderEmojiPicker();
+      break;
+    case 'chat-emoji-select': {
+      const input = document.querySelector('.online-chat-form input');
+      if (!input) break;
+      const start = input.selectionStart;
+      const end = input.selectionEnd;
+      input.setRangeText(button.dataset.emoji, start, end, 'end');
+      recordEmojiUsage(button.dataset.emoji);
+      input.focus();
+      break;
+    }
+    case 'chat-sticker-toggle':
+      stickerPickerOpen = !stickerPickerOpen;
+      if (stickerPickerOpen) {
+        emojiPickerOpen = false;
+        document.querySelector('.chat-emoji-toggle')?.setAttribute('aria-expanded', 'false');
+      }
+      button.setAttribute('aria-expanded', String(stickerPickerOpen));
+      renderEmojiPicker();
+      renderStickerPicker();
+      break;
+    case 'chat-sticker-send': {
+      const stickerToken = button.dataset.stickerToken;
+      if (!stickerToken) break;
+      emitOnlineEvent('sendChatMessage', { text: stickerToken });
+      break;
+    }
+    case 'online-ptt':
+      break;
     case 'online-copy-code':
       navigator.clipboard?.writeText(onlineState?.roomId || '').then(() => {
         onlineMessage = 'تم نسخ رمز الغرفة.';
@@ -1420,6 +1818,15 @@ function handleOnlineForm(event) {
   if (!form) return;
   event.preventDefault();
 
+  if (form.dataset.onlineForm === 'chat') {
+    const input = form.elements.namedItem('message');
+    const text = input?.value.trim() || '';
+    emitOnlineEvent('sendChatMessage', { text }).then((sent) => {
+      if (sent && input) input.value = '';
+    });
+    return;
+  }
+
   if (form.dataset.onlineForm === 'create') {
     const name = document.getElementById('online-boss-name')?.value.trim() || '';
     emitEntryEvent('createRoom', { name });
@@ -1468,6 +1875,11 @@ socket.on('connect', () => {
 
 socket.on('disconnect', () => {
   onlineConnectionStatus = 'disconnected';
+  onlineVoiceSpeakers.clear();
+  onlineSpeakingSent = false;
+  updateVoiceSpeakerIndicators();
+  voiceConnections.forEach((peer, peerSocketId) => closeVoiceConnection(peerSocketId, peer));
+  stopPushToTalk();
   if (onlineSession && onlineState) renderOnlineRoom();
 });
 
@@ -1478,6 +1890,7 @@ socket.on('roomState', (state) => {
     playOnlineOutcome(state.finalDecision);
   }
   onlineState = state;
+  onlineVoiceSpeakers = new Map((state.voiceSpeakers || []).map((speaker) => [speaker.socketId, speaker]));
   onlineConnectionStatus = 'connected';
   renderOnlineRoom();
 });
@@ -1502,8 +1915,99 @@ socket.on('eliminationResult', (payload) => {
   if (onlineState) renderOnlineRoom();
 });
 
+socket.on('chatMessage', (message) => {
+  if (!onlineSession || !onlineState) return;
+  if (!onlineChatMessages.some((entry) => entry.id === message.id)) onlineChatMessages.push(message);
+  onlineChatMessages = onlineChatMessages.slice(-50);
+  onlineState.chatMessages = onlineChatMessages;
+  const list = document.querySelector('.online-chat-messages');
+  if (list) {
+    list.insertAdjacentHTML('beforeend', chatMessageMarkup(message));
+    while (list.children.length > 50) list.firstElementChild.remove();
+    list.scrollTop = list.scrollHeight;
+  }
+  const count = document.querySelector('.chat-count');
+  if (count) count.textContent = String(onlineChatMessages.length);
+});
+
+socket.on('reaction', (payload) => {
+  if (!onlineSession || !onlineState || onlineState.status !== 'DEFENSE') return;
+  const layer = document.querySelector('.online-reaction-layer');
+  if (!layer) return;
+  const item = document.createElement('div');
+  item.className = 'floating-reaction';
+  item.innerHTML = `<span>${escapeHtml(payload.emoji)}</span><small>${escapeHtml(payload.name)}</small>`;
+  layer.appendChild(item);
+  window.setTimeout(() => item.remove(), 2600);
+});
+
+socket.on('voiceSignal', async ({ from, signal } = {}) => {
+  const peer = voiceConnections.get(from);
+  if (!peer || !signal) return;
+  const connection = peer.connection;
+  try {
+    if (signal.type === 'description') {
+      const description = signal.description;
+      const readyForOffer = !peer.makingOffer
+        && (connection.signalingState === 'stable' || peer.settingRemoteAnswer);
+      const offerCollision = description.type === 'offer' && !readyForOffer;
+      peer.ignoreOffer = !peer.polite && offerCollision;
+      if (peer.ignoreOffer) return;
+      if (offerCollision && peer.polite) await connection.setLocalDescription({ type: 'rollback' });
+      peer.settingRemoteAnswer = description.type === 'answer';
+      await connection.setRemoteDescription(description);
+      peer.settingRemoteAnswer = false;
+      for (const candidate of peer.pendingCandidates.splice(0)) {
+        await connection.addIceCandidate(candidate);
+      }
+      if (description.type === 'offer') {
+        await connection.setLocalDescription();
+        sendVoiceSignal(from, { type: 'description', description: connection.localDescription.toJSON() });
+      }
+    } else if (signal.type === 'candidate' && signal.candidate) {
+      if (!connection.remoteDescription) {
+        peer.pendingCandidates.push(signal.candidate);
+        return;
+      }
+      try {
+        await connection.addIceCandidate(signal.candidate);
+      } catch (error) {
+        if (!peer.ignoreOffer) throw error;
+      }
+    }
+  } catch (error) {
+    console.warn('Unable to apply the voice signal:', error);
+  }
+});
+
+socket.on('voiceSpeaking', (payload = {}) => {
+  if (!onlineSession || !payload.socketId) return;
+  if (payload.active) onlineVoiceSpeakers.set(payload.socketId, payload);
+  else onlineVoiceSpeakers.delete(payload.socketId);
+  updateVoiceSpeakerIndicators();
+});
+
 app.addEventListener('click', handleGameAction);
 app.addEventListener('submit', handleOnlineForm);
+app.addEventListener('change', (event) => {
+  const select = event.target instanceof HTMLSelectElement ? event.target : null;
+  if (!select || select.dataset.action !== 'emoji-category') return;
+  emojiSelectedGroup = select.value;
+  emojiShowAll = false;
+  renderEmojiPicker();
+});
+document.addEventListener('pointerdown', (event) => {
+  const button = event.target instanceof Element ? event.target.closest('[data-action="online-ptt"]') : null;
+  if (!button) return;
+  event.preventDefault();
+  startPushToTalk();
+});
+document.addEventListener('pointerup', stopPushToTalk);
+document.addEventListener('pointercancel', stopPushToTalk);
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) stopPushToTalk();
+});
+window.addEventListener('blur', stopPushToTalk);
 document.addEventListener('click', (event) => {
   const topAction = event.target.closest('[data-top-action]');
   if (!topAction) {
@@ -1514,6 +2018,7 @@ document.addEventListener('click', (event) => {
 });
 
 renderTopBarActions();
+loadEmojiCatalog();
 if (onlineSession) {
   showOnlineEntryScreen();
   reconnectOnlineSession();
