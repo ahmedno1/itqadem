@@ -14,6 +14,7 @@
       finalDefenseText: '',
       countdown: 60,
       finalWinner: '',
+      finalistId: '',
       lastDecision: '',
       timerId: null
     };
