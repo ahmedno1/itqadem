@@ -638,6 +638,24 @@ textarea {
   margin-top: 20px;
 }
 
+.saved-room-return {
+  display: grid;
+  gap: 8px;
+  margin-top: 18px;
+  padding: 14px;
+  border: 3px solid var(--dark-navy);
+  border-radius: 14px;
+  background: #e2fff2;
+}
+
+.saved-room-return span {
+  font-size: 0.85rem;
+}
+
+.saved-room-return .game-btn {
+  min-height: 56px;
+}
+
 .online-form {
   display: grid;
   align-content: start;
@@ -1194,6 +1212,61 @@ textarea {
   font-weight: 700;
 }
 
+.manager-handoff,
+.manager-vote-panel,
+.manager-restart-actions,
+.manager-recovery-panel {
+  display: grid;
+  gap: 10px;
+  margin-top: 18px;
+  padding: 14px;
+  border: 2px dashed rgba(11, 19, 43, 0.25);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.62);
+}
+
+.manager-recovery-panel {
+  border-color: #d2a526;
+  background: #fff9dd;
+}
+
+.manager-recovery-countdown {
+  font-size: 0.85rem;
+}
+
+.manager-recovery-countdown b {
+  color: #9b2828;
+  font-size: 1.15rem;
+}
+
+.manager-waiting-countdown {
+  display: grid;
+  justify-items: center;
+  gap: 5px;
+  margin: 18px auto;
+}
+
+.manager-waiting-countdown span {
+  display: grid;
+  width: 74px;
+  height: 74px;
+  place-items: center;
+  border: 3px solid var(--dark-navy);
+  border-radius: 50%;
+  background: #ffd166;
+  font-size: 2rem;
+  font-weight: 900;
+}
+
+.manager-handoff strong,
+.manager-vote-panel strong {
+  font-size: 0.9rem;
+}
+
+.manager-restart-actions {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
 .room-code-box {
   display: flex;
   align-items: center;
@@ -1271,6 +1344,59 @@ textarea {
   border-style: dashed;
   background: #f1f1f1;
   opacity: 0.72;
+}
+
+.lobby-player-actions {
+  position: relative;
+  display: inline-flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 5px;
+}
+
+.player-menu-toggle {
+  display: grid;
+  width: 38px;
+  min-height: 36px;
+  place-items: center;
+  border: 2px solid var(--dark-navy);
+  border-radius: 9px;
+  background: #fff;
+  color: var(--dark-navy);
+  font: inherit;
+  font-size: 1rem;
+  font-weight: 900;
+  letter-spacing: 2px;
+  cursor: pointer;
+}
+
+.player-menu {
+  position: absolute;
+  z-index: 20;
+  inset-inline-end: 0;
+  top: calc(100% + 5px);
+  display: none;
+  min-width: 132px;
+  padding: 6px;
+  border: 2px solid var(--dark-navy);
+  border-radius: 10px;
+  background: #fff;
+  box-shadow: 0 5px 0 rgba(11, 19, 43, 0.3);
+}
+
+.player-menu.is-open {
+  display: grid;
+  gap: 5px;
+}
+
+.player-menu .mini-btn {
+  width: 100%;
+}
+
+.lobby-player-actions .mini-btn.danger {
+  border-color: #9b2828;
+  background: #ffe4e1;
+  color: #781d1d;
 }
 
 .online-connection-state {

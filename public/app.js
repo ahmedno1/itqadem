@@ -30,6 +30,8 @@ let localVoiceStream = null;
 let voiceStreamRequest = null;
 let voicePressed = false;
 let onlineSpeakingSent = false;
+let onlineManagerVotePromptedAt = null;
+let openPlayerMenuId = null;
 
 try {
   const emojiUsageState = window.AtqadamEmojiCatalog.readUsage();
@@ -261,6 +263,35 @@ function requestExitConfirmation() {
   });
 }
 
+function requestLeaveOnlineConfirmation() {
+  showConfirmDialog({
+    title: 'مغادرة الغرفة',
+    message: 'هل أنت متأكد أنك تريد مغادرة الغرفة؟ ستحتاج إلى رمز الغرفة للعودة لاحقاً.',
+    confirmText: 'نعم، غادر الغرفة',
+    onConfirm: () => leaveOnlineRoom()
+  });
+}
+
+function requestManagerTransferConfirmation(playerId, playerName) {
+  showConfirmDialog({
+    title: 'تسليم الإدارة',
+    message: `هل أنت متأكد أنك تريد تسليم إدارة الغرفة إلى ${playerName}؟ ستعود لاعباً داخل الغرفة.`,
+    confirmText: 'نعم، سلّم الإدارة',
+    onConfirm: () => emitOnlineEvent('transferManager', { playerId })
+  });
+}
+
+function requestKickConfirmation(playerId, playerName, permanent = false) {
+  showConfirmDialog({
+    title: permanent ? 'منع اللاعب' : 'طرد اللاعب',
+    message: permanent
+      ? `هل أنت متأكد من منع ${playerName} من هذه الغرفة؟ لن يتمكن من العودة إليها حتى تتغير الغرفة.`
+      : `هل أنت متأكد من طرد ${playerName} مؤقتاً؟ يمكنه العودة باستخدام رمز الغرفة نفسه.`,
+    confirmText: permanent ? 'نعم، امنعه' : 'نعم، اطرده',
+    onConfirm: () => emitOnlineEvent(permanent ? 'banPlayer' : 'kickPlayer', { playerId })
+  });
+}
+
 function setOnlineMessage(message) {
   onlineMessage = message || '';
   const messageElement = document.getElementById('online-message');
@@ -428,12 +459,13 @@ function showOnlineEntryScreen() {
           <button class="secondary-btn" type="submit">انضمام</button>
         </form>
       </div>
+      ${onlineSession ? `<div class="saved-room-return"><strong>لديك غرفة محفوظة</strong><span>${escapeHtml(onlineSession.name || 'اللاعب')} في الغرفة ${escapeHtml(onlineSession.roomId || '')}</span><button class="game-btn" type="button" data-action="online-reconnect-now">العودة إلى آخر غرفة</button></div>` : ''}
       <div class="footer-actions"><button class="secondary-btn" type="button" data-action="online-back-menu">العودة</button></div>
     </section>
   `;
 }
 
-function onlinePlayerList(players, allowElimination = false) {
+function onlinePlayerList(players, allowElimination = false, allowManagerTransfer = false, allowLobbyModeration = false) {
   return `<div class="online-players-list">${players.map((player) => {
     const playerClasses = [
       player.isEliminated ? 'is-eliminated' : '',
@@ -444,7 +476,11 @@ function onlinePlayerList(players, allowElimination = false) {
     return `<div class="online-player-row ${playerClasses}">
       <div><strong>${escapeHtml(player.name)}</strong><small>${roleLabel}</small></div>
       <span class="online-connection-state ${player.isConnected ? 'connected' : 'disconnected'}">${connectionLabel}</span>
-      ${allowElimination && !player.isEliminated
+      ${allowLobbyModeration && player.isConnected
+        ? `<span class="lobby-player-actions"><button class="player-menu-toggle" type="button" data-action="online-player-menu-toggle" data-player-id="${escapeHtml(player.id)}" aria-label="خيارات ${escapeHtml(player.name)}" aria-expanded="${openPlayerMenuId === player.id}">•••</button><span class="player-menu${openPlayerMenuId === player.id ? ' is-open' : ''}"><button class="mini-btn" type="button" data-action="online-transfer-manager" data-player-id="${escapeHtml(player.id)}" data-player-name="${escapeHtml(player.name)}">تسليم الإدارة</button><button class="mini-btn" type="button" data-action="online-kick-player" data-player-id="${escapeHtml(player.id)}" data-player-name="${escapeHtml(player.name)}">طرد</button><button class="mini-btn danger" type="button" data-action="online-ban-player" data-player-id="${escapeHtml(player.id)}" data-player-name="${escapeHtml(player.name)}">منع</button></span></span>`
+        : allowManagerTransfer && player.isConnected
+        ? `<button class="mini-btn" type="button" data-action="online-transfer-manager" data-player-id="${escapeHtml(player.id)}" data-player-name="${escapeHtml(player.name)}">تسليم الإدارة</button>`
+        : allowElimination && !player.isEliminated
         ? `<button class="mini-btn" type="button" data-action="online-eliminate" data-player-id="${escapeHtml(player.id)}">استبعاد</button>`
         : `<span class="online-player-status">${player.hasSubmittedTrap ? 'أرسل الإجابة' : (player.isEliminated ? 'مخرب' : 'في الانتظار')}</span>`}
     </div>`;
@@ -454,10 +490,21 @@ function onlinePlayerList(players, allowElimination = false) {
 function onlineHeader(state) {
   const connection = onlineConnectionStatus === 'connected' ? 'متصل بالخادم' : 'جارٍ استعادة الاتصال';
   return `<div class="player-meta">
-    <span class="status-pill">غرفة ${escapeHtml(state.roomId)}</span>
+    <span class="status-pill">المدير: ${escapeHtml(state.bossName)}</span>
     <span class="online-connection ${onlineConnectionStatus}">${connection}</span>
     ${state.role !== 'boss' ? `<span class="online-manager-presence ${state.bossConnected ? 'connected' : 'disconnected'}">المدير: ${state.bossConnected ? 'متصل' : 'انقطع الاتصال'}</span>` : ''}
   </div>`;
+}
+
+function managerRecoveryMarkup(state) {
+  const canVote = Number.isFinite(state.managerVoteAvailableAt)
+    && Date.now() + onlineServerOffset >= state.managerVoteAvailableAt;
+  if (state.managerVote?.active) {
+    return `<div class="manager-recovery-panel"><strong>تصويت اختيار مدير جديد</strong>${state.managerVote.candidates.map((candidate) => `<button class="secondary-btn" type="button" data-action="online-cast-manager-vote" data-player-id="${escapeHtml(candidate.id)}">التصويت لـ ${escapeHtml(candidate.name)} (${state.managerVote.counts?.[candidate.id] || 0})</button>`).join('')}</div>`;
+  }
+  return `<div class="manager-recovery-panel"><strong>${state.status === 'MANAGER_PAUSED' ? 'اللعبة متوقفة مؤقتاً بانتظار عودة المدير' : 'بانتظار عودة المدير إلى الغرفة'}</strong><span class="manager-recovery-countdown">المهلة المتبقية: <b data-manager-countdown>--</b> ثانية</span>${canVote
+    ? '<button class="secondary-btn" type="button" data-action="online-start-manager-vote">بدء التصويت لتغيير المدير</button>'
+    : '<span>سيظهر خيار التصويت بعد انتهاء مهلة الانتظار.</span>'}</div>`;
 }
 
 function chatMessageMarkup(message) {
@@ -789,10 +836,16 @@ function renderOnlineRoom() {
       <h2>غرفة الانتظار</h2>
       <div class="room-code-box"><span>رمز الغرفة</span><strong>${escapeHtml(state.roomId)}</strong><button class="mini-btn" type="button" data-action="online-copy-code">نسخ الرمز</button></div>
       <p class="online-instruction">شارك الرمز مع المتقدمين. تبدأ اللعبة عند اتصال متقدمين اثنين على الأقل.</p>
-      ${onlinePlayerList(state.players)}
+      ${onlinePlayerList(state.players, false, isBoss, isBoss)}
       ${isBoss
-        ? `<button class="game-btn" type="button" data-action="online-start" ${connectedCount < 2 ? 'disabled' : ''}>ابدأ المقابلة (${connectedCount} متصل)</button>`
-        : '<div class="online-waiting">بانتظار المدير لبدء المقابلة</div>'}`;
+        ? `<button class="game-btn" type="button" data-action="online-start" ${connectedCount < 2 ? 'disabled' : ''}>ابدأ المقابلة (${connectedCount} متصل)</button>
+          `
+        : state.managerAway ? managerRecoveryMarkup(state) : '<div class="online-waiting">بانتظار المدير لبدء المقابلة</div>'}`;
+  } else if (state.status === 'MANAGER_PAUSED') {
+    screen = `${onlineHeader(state)}<span class="status-pill">توقف مؤقت</span>
+      <h2>بانتظار عودة المدير</h2>
+      <div class="manager-waiting-countdown"><span data-manager-countdown>30</span><small>ثانية قبل العودة إلى غرفة الانتظار</small></div>
+      ${managerRecoveryMarkup(state)}`;
   } else if (state.status === 'BOSS_QUESTION') {
     screen = `${onlineHeader(state)}<span class="meta-badge">الجولة ${state.round}</span>
       <h2>${isBoss ? 'اكتب سؤال المقابلة' : 'المدير يجهز سؤال المقابلة'}</h2>
@@ -848,14 +901,19 @@ function renderOnlineRoom() {
       ${isBoss && !eliminated ? onlinePlayerList(state.players, true) : '<div class="online-waiting">سيبدأ المدير الجولة التالية بعد إعلان النتيجة</div>'}`;
   } else if (state.status === 'FINAL_CHALLENGE') {
     const finalist = state.finalist || state.players.find((player) => !player.isEliminated);
+    const managerEndActions = state.finalStage === 'COMPLETE'
+      ? state.managerVote?.active
+        ? `<div class="manager-vote-panel"><strong>تصويت اختيار المدير الجديد</strong>${state.managerVote.candidates.map((candidate) => `<button class="secondary-btn" type="button" data-action="online-cast-manager-vote" data-player-id="${escapeHtml(candidate.id)}">التصويت لـ ${escapeHtml(candidate.name)} (${state.managerVote.counts?.[candidate.id] || 0})</button>`).join('')}</div>`
+        : `<div class="manager-restart-actions"><button class="game-btn" type="button" data-action="online-restart-same" ${isBoss ? '' : 'disabled'}>إعادة اللعب بالمدير نفسه</button><button class="secondary-btn" type="button" data-action="online-start-manager-vote">التصويت لمدير جديد</button></div>`
+      : '';
     const finalAction = state.finalStage === 'DECISION' && isBoss
       ? `<div class="info-box"><p>سؤال الجولة الأخيرة</p><strong>${escapeHtml(state.finalQuestion || state.currentQuestion)}</strong></div><div class="result-box"><p>الناجي الأخير من جولات التبرير</p><strong>${escapeHtml(finalist?.name || '—')}</strong><p class="final-decision-prompt">هل فاز المتقدم الأخير أم يُستبعد مع الباقين؟</p></div><div class="footer-actions"><button class="game-btn" type="button" data-action="online-final-decision" data-decision="accept">إعلان فوزه</button><button class="secondary-btn" type="button" data-action="online-final-decision" data-decision="reject">استبعاده مع الباقين</button></div>`
           : state.finalStage === 'DECISION'
             ? `<div class="info-box"><p>سؤال الجولة الأخيرة</p><strong>${escapeHtml(state.finalQuestion || state.currentQuestion)}</strong></div><div class="online-waiting">المدير يقرر الآن إن كان ${escapeHtml(finalist?.name || 'المتقدم الأخير')} قد فاز أم سيُستبعد مع الباقين</div>`
           : state.finalStage === 'COMPLETE'
             ? finalist
-              ? `<div class="victory-panel ${state.finalDecision === 'accept' ? 'accepted' : 'rejected'}"><span>${state.finalDecision === 'accept' ? 'فاز باللعبة' : 'استُبعد مع الباقين'}</span><strong>${escapeHtml(finalist.name)}</strong></div>`
-              : '<div class="victory-panel rejected"><span>تم استبعاد جميع المتقدمين</span><strong>لا يوجد فائز</strong></div>'
+              ? `<div class="victory-panel ${state.finalDecision === 'accept' ? 'accepted' : 'rejected'}"><span>${state.finalDecision === 'accept' ? 'فاز باللعبة' : 'استُبعد مع الباقين'}</span><strong>${escapeHtml(finalist.name)}</strong></div>${managerEndActions}`
+              : `<div class="victory-panel rejected"><span>تم استبعاد جميع المتقدمين</span><strong>لا يوجد فائز</strong></div>${managerEndActions}`
             : '<div class="online-waiting">بانتظار قرار الجولة الأخيرة</div>';
     screen = `${onlineHeader(state)}<span class="status-pill">حسم الجولة الأخيرة</span><h2>الناجي الأخير: ${escapeHtml(finalist?.name || 'لا يوجد لاعب باقٍ')}</h2>${finalAction}`;
   }
@@ -866,6 +924,8 @@ function renderOnlineRoom() {
   syncVoiceConnections(state);
   if (state.status === 'DEFENSE_ENDING') {
     startOnlineCountdown(state.defenseEndsAt, '[data-defense-ending-countdown]', true);
+  } else if (state.managerAway && state.managerResumeDeadline) {
+    startOnlineCountdown(state.managerResumeDeadline, '[data-manager-countdown]');
   }
 }
 
@@ -881,6 +941,16 @@ function startOnlineCountdown(turnEndsAt, selector = '[data-online-countdown]', 
     }
     const count = Math.max(0, Math.ceil((turnEndsAt - (Date.now() + onlineServerOffset)) / 1000));
     element.textContent = String(count);
+    if (selector === '[data-manager-countdown]'
+      && onlineState?.managerVoteAvailableAt
+      && Date.now() + onlineServerOffset >= onlineState.managerVoteAvailableAt
+      && !onlineState.managerVote
+      && onlineManagerVotePromptedAt !== onlineState.managerVoteAvailableAt) {
+      onlineManagerVotePromptedAt = onlineState.managerVoteAvailableAt;
+      clearOnlineCountdown();
+      renderOnlineRoom();
+      return;
+    }
     if (withSound && count > 0 && count !== previousCount) playDefenseCountdownTick();
     previousCount = count;
   };
@@ -891,13 +961,12 @@ function startOnlineCountdown(turnEndsAt, selector = '[data-online-countdown]', 
 function leaveOnlineRoom() {
   emitOnlineEvent('leaveRoom').finally(() => {
     closeVoiceConnections();
-    localStorage.removeItem(ONLINE_SESSION_KEY);
-    onlineSession = null;
     onlineState = null;
     onlineEliminationResult = null;
-    onlineMessage = '';
+    onlineMessage = 'غادرت الغرفة. يمكنك العودة إليها من الزر الموجود أدناه.';
     clearOnlineCountdown();
-    buildMenuScreen();
+    document.body.classList.remove('game-started');
+    showOnlineEntryScreen();
   });
 }
 
@@ -1616,7 +1685,7 @@ function handleTopBarAction(action) {
       requestExitConfirmation();
       break;
     case 'leave-online':
-      leaveOnlineRoom();
+      requestLeaveOnlineConfirmation();
       break;
     default:
       break;
@@ -1719,8 +1788,36 @@ function handleGameAction(event) {
       onlineMessage = '';
       buildMenuScreen();
       break;
+    case 'online-reconnect-now':
+      reconnectOnlineSession();
+      break;
     case 'online-start':
       emitOnlineEvent('startGame');
+      break;
+    case 'online-transfer-manager':
+      openPlayerMenuId = null;
+      requestManagerTransferConfirmation(button.dataset.playerId, button.dataset.playerName || 'اللاعب المحدد');
+      break;
+    case 'online-kick-player':
+      openPlayerMenuId = null;
+      requestKickConfirmation(button.dataset.playerId, button.dataset.playerName || 'اللاعب المحدد');
+      break;
+    case 'online-ban-player':
+      openPlayerMenuId = null;
+      requestKickConfirmation(button.dataset.playerId, button.dataset.playerName || 'اللاعب المحدد', true);
+      break;
+    case 'online-player-menu-toggle':
+      openPlayerMenuId = openPlayerMenuId === button.dataset.playerId ? null : button.dataset.playerId;
+      renderOnlineRoom();
+      break;
+    case 'online-restart-same':
+      emitOnlineEvent('restartRoom');
+      break;
+    case 'online-start-manager-vote':
+      emitOnlineEvent('startManagerVote');
+      break;
+    case 'online-cast-manager-vote':
+      emitOnlineEvent('castManagerVote', { playerId: button.dataset.playerId });
       break;
     case 'online-send-question': {
       const question = document.getElementById('online-boss-question')?.value.trim() || '';
@@ -1968,7 +2065,10 @@ socket.on('disconnect', () => {
   updateVoiceSpeakerIndicators();
   voiceConnections.forEach((peer, peerSocketId) => closeVoiceConnection(peerSocketId, peer));
   stopPushToTalk();
-  if (onlineSession && onlineState) renderOnlineRoom();
+  if (onlineSession && onlineState) {
+    onlineMessage = 'انقطع الاتصال. يمكنك العودة إلى آخر غرفة من الزر أدناه.';
+    showOnlineEntryScreen();
+  }
 });
 
 socket.on('roomState', (state) => {
@@ -1978,6 +2078,14 @@ socket.on('roomState', (state) => {
     playOnlineOutcome(state.finalDecision);
   }
   onlineState = state;
+  if (onlineSession && state.sessionToken && (state.role !== onlineSession.role || state.sessionToken !== onlineSession.resumeToken)) {
+    saveOnlineSession({
+      ...onlineSession,
+      resumeToken: state.sessionToken,
+      role: state.role,
+      name: state.role === 'boss' ? state.bossName : onlineSession.name
+    });
+  }
   onlineVoiceSpeakers = new Map((state.voiceSpeakers || []).map((speaker) => [speaker.socketId, speaker]));
   onlineConnectionStatus = 'connected';
   renderOnlineRoom();

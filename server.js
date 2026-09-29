@@ -9,7 +9,11 @@ const app = express();
 const server = http.createServer(app);
 const PORT = Number(process.env.PORT) || 3000;
 const ROOM_CODE_CHARACTERS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-const ROOM_CLEANUP_DELAY = 30 * 60 * 1000;
+const ROOM_CLEANUP_DELAY = 30 * 1000;
+const MANAGER_GAME_GRACE = 30 * 1000;
+const MANAGER_LOBBY_GRACE = 10 * 1000;
+const MANAGER_GAME_VOTE_DELAY = 15 * 1000;
+const MANAGER_LOBBY_VOTE_DELAY = 5 * 1000;
 const PRIVATE_PREVIEW_DURATION = 20 * 1000;
 const DEFENSE_ENDING_DURATION = 3 * 1000;
 const ELIMINATION_PAUSE = 2500;
@@ -85,6 +89,22 @@ function publicRoomState(room, socket) {
   const speaker = room.defenseOrder[room.turnIndex];
   const speakerPlayer = room.players.find((player) => player.id === speaker) || null;
   const finalist = room.players.find((player) => player.id === room.finalistId) || null;
+  const sessionToken = role === 'boss'
+    ? room.bossResumeToken
+    : me?.resumeToken || null;
+  const managerVoteCounts = new Map();
+  for (const candidateId of room.managerVote?.votes.values() || []) {
+    managerVoteCounts.set(candidateId, (managerVoteCounts.get(candidateId) || 0) + 1);
+  }
+  const managerVote = room.managerVote
+    ? {
+      active: true,
+      counts: Object.fromEntries(managerVoteCounts),
+      candidates: room.players
+        .filter((player) => player.isConnected && !player.isEliminated)
+        .map((player) => ({ id: player.id, name: player.name }))
+    }
+    : null;
 
   return {
     roomId: room.roomId,
@@ -114,6 +134,13 @@ function publicRoomState(room, socket) {
     finalQuestion: room.finalQuestion,
     finalDefense: room.finalDefense,
     finalDecision: room.finalDecision,
+    sessionToken,
+    managerVote,
+    managerAway: !room.bossConnected,
+    managerResumeDeadline: room.managerResumeDeadline,
+    managerVoteAvailableAt: room.managerVoteAvailableAt,
+    pausedStatus: room.pausedStatus,
+    managerExpired: room.managerExpired,
     finalRound: room.finalRound,
     trapAuthorIds: room.trapAuthorIds,
     trapTargetIds: room.trapTargetIds,
@@ -202,6 +229,13 @@ function clearRoomTimer(room) {
   if (room.timer) {
     clearTimeout(room.timer);
     room.timer = null;
+  }
+}
+
+function clearManagerTimer(room) {
+  if (room.managerTimer) {
+    clearTimeout(room.managerTimer);
+    room.managerTimer = null;
   }
 }
 
@@ -349,6 +383,119 @@ function scheduleCleanup(room) {
   room.cleanupTimer = setTimeout(() => clearRoom(room), ROOM_CLEANUP_DELAY);
 }
 
+function resetRoomToLobby(room) {
+  clearRoomTimer(room);
+  clearManagerTimer(room);
+  room.status = 'LOBBY';
+  room.originalPlayerCount = 0;
+  room.currentQuestion = '';
+  room.round = 1;
+  room.turnIndex = 0;
+  room.defenseOrder = [];
+  room.turnEndsAt = null;
+  room.defenseEndsAt = null;
+  room.trapRevealed = false;
+  room.trapAnswers.clear();
+  room.assignedTraps.clear();
+  room.trapAuthorIds = [];
+  room.trapTargetIds = [];
+  room.finalRound = false;
+  room.finalStage = null;
+  room.finalistId = null;
+  room.finalQuestion = '';
+  room.finalDefense = '';
+  room.finalDecision = null;
+  room.eliminatedPlayerId = null;
+  room.managerVote = null;
+  room.managerResumeDeadline = null;
+  room.managerVoteAvailableAt = null;
+  room.pausedStatus = null;
+  room.players.forEach((player) => {
+    player.isEliminated = false;
+  });
+  publishRoom(room);
+}
+
+function pauseForManagerDeparture(room) {
+  if (room.managerResumeDeadline || (room.status === 'FINAL_CHALLENGE' && room.finalStage === 'COMPLETE')) return;
+  const isLobby = room.status === 'LOBBY';
+  const now = Date.now();
+  room.pausedStatus = isLobby ? null : room.status;
+  if (!isLobby) {
+    clearRoomTimer(room);
+    room.status = 'MANAGER_PAUSED';
+  }
+  room.managerResumeDeadline = now + (isLobby ? MANAGER_LOBBY_GRACE : MANAGER_GAME_GRACE);
+  room.managerVoteAvailableAt = now + (isLobby ? MANAGER_LOBBY_VOTE_DELAY : MANAGER_GAME_VOTE_DELAY);
+  room.managerVote = null;
+  clearManagerTimer(room);
+  room.managerTimer = setTimeout(() => {
+    if (room.bossConnected) return;
+    room.managerExpired = true;
+    if (room.status !== 'LOBBY') resetRoomToLobby(room);
+    else {
+      room.managerResumeDeadline = null;
+      room.managerVoteAvailableAt = Date.now();
+      publishRoom(room);
+    }
+  }, isLobby ? MANAGER_LOBBY_GRACE : MANAGER_GAME_GRACE);
+  publishRoom(room);
+}
+
+function restoreAfterManagerReconnect(room) {
+  clearManagerTimer(room);
+  const pausedStatus = room.pausedStatus;
+  room.managerResumeDeadline = null;
+  room.managerVoteAvailableAt = null;
+  room.pausedStatus = null;
+  room.managerVote = null;
+  if (pausedStatus) {
+    room.status = pausedStatus === 'DEFENSE_ENDING' ? 'DEFENSE' : pausedStatus;
+    if (pausedStatus === 'DEFENSE' && room.defenseOrder.length > 0 && !room.trapRevealed) beginCurrentDefense(room);
+    else publishRoom(room);
+  } else {
+    publishRoom(room);
+  }
+}
+
+function transferManager(room, target) {
+  const oldBoss = {
+    id: crypto.randomUUID(),
+    socketId: room.bossId,
+    resumeToken: createToken(),
+    name: room.bossName,
+    isEliminated: false,
+    isConnected: room.bossConnected
+  };
+  room.players = room.players.filter((player) => player.id !== target.id);
+  room.players.push(oldBoss);
+  room.bossId = target.socketId;
+  room.bossName = target.name;
+  room.bossResumeToken = target.resumeToken;
+  room.bossConnected = true;
+  room.managerExpired = false;
+  resetRoomToLobby(room);
+}
+
+function finishManagerVote(room) {
+  if (!room.managerVote) return false;
+  const connectedCount = connectedPlayers(room).length + (room.bossConnected ? 1 : 0);
+  const counts = new Map();
+  for (const candidateId of room.managerVote.votes.values()) {
+    counts.set(candidateId, (counts.get(candidateId) || 0) + 1);
+  }
+  const candidates = room.players.filter((player) => player.isConnected && !player.isEliminated);
+  if (candidates.length === 0) return false;
+  const winner = candidates.find((player) => (counts.get(player.id) || 0) > connectedCount / 2);
+  if (!winner && room.managerVote.votes.size < connectedCount) return false;
+  const highestVotes = Math.max(...candidates.map((player) => counts.get(player.id) || 0));
+  const tiedCandidates = candidates.filter((player) => (counts.get(player.id) || 0) === highestVotes);
+  const selectedWinner = winner || tiedCandidates[crypto.randomInt(tiedCandidates.length)];
+  if (!selectedWinner) return false;
+  transferManager(room, selectedWinner);
+  return true;
+}
+
 function validateText(value, maxLength) {
   return typeof value === 'string' && value.trim().length > 0 && value.trim().length <= maxLength;
 }
@@ -390,6 +537,13 @@ io.on('connection', (socket) => {
       eliminatedPlayerId: null,
       chatMessages: [],
       voiceSpeakers: new Map(),
+      managerVote: null,
+      managerResumeDeadline: null,
+      managerVoteAvailableAt: null,
+      pausedStatus: null,
+      managerTimer: null,
+      managerExpired: false,
+        bannedNames: new Set(),
       timer: null,
       cleanupTimer: null
     };
@@ -408,6 +562,7 @@ io.on('connection', (socket) => {
     if (room.status !== 'LOBBY') return sendError(socket, callback, 'بدأت اللعبة بالفعل ولا يمكن الانضمام الآن.');
     if (!validateText(name, 40)) return sendError(socket, callback, 'يرجى إدخال اسم صحيح (40 حرفاً كحد أقصى).');
     const normalized = name.toLocaleLowerCase();
+    if (room.bannedNames.has(normalized)) return sendError(socket, callback, 'تم منع هذا الاسم من دخول الغرفة. استخدم غرفة أخرى.');
     if (room.bossName.toLocaleLowerCase() === normalized || room.players.some((player) => player.name.toLocaleLowerCase() === normalized)) {
       return sendError(socket, callback, 'هذا الاسم مستخدم في الغرفة بالفعل. اختر اسماً آخر.');
     }
@@ -438,13 +593,33 @@ io.on('connection', (socket) => {
     let role;
     let name;
     if (room.bossResumeToken === payload.resumeToken) {
-      room.bossId = socket.id;
-      room.bossConnected = true;
-      role = 'boss';
-      name = room.bossName;
+      if (room.managerExpired) {
+        const formerManager = {
+          id: crypto.randomUUID(),
+          socketId: socket.id,
+          resumeToken: payload.resumeToken,
+          name: room.bossName,
+          isEliminated: false,
+          isConnected: true
+        };
+        room.players.push(formerManager);
+        room.bossId = null;
+        room.bossResumeToken = null;
+        room.bossConnected = false;
+        room.managerExpired = false;
+        room.managerResumeDeadline = null;
+        role = 'player';
+        name = formerManager.name;
+      } else {
+        room.bossId = socket.id;
+        room.bossConnected = true;
+        restoreAfterManagerReconnect(room);
+        role = 'boss';
+        name = room.bossName;
+      }
     } else {
       const player = room.players.find((entry) => entry.resumeToken === payload.resumeToken);
-      if (!player) return sendError(socket, callback, 'تعذر استعادة اللاعب في هذه الغرفة.');
+      if (!player || room.bannedNames.has(player.name.toLocaleLowerCase())) return sendError(socket, callback, 'تم منع هذا اللاعب من دخول الغرفة.');
       player.socketId = socket.id;
       player.isConnected = true;
       role = 'player';
@@ -472,6 +647,76 @@ io.on('connection', (socket) => {
     room.finalRound = false;
     publishRoom(room);
     replyWithRoom(socket, callback, room);
+  });
+
+  socket.on('transferManager', (payload = {}, callback) => {
+    const room = getRoomForSocket(socket);
+    const target = room?.players.find((player) => player.id === payload.playerId);
+    if (!room || room.bossId !== socket.id) return sendError(socket, callback, 'تسليم الإدارة متاح للمدير فقط.');
+    if (room.status !== 'LOBBY') return sendError(socket, callback, 'يمكن تغيير المدير قبل بدء اللعبة فقط.');
+    if (!target?.isConnected || target.isEliminated) return sendError(socket, callback, 'المتقدم المحدد غير متصل أو غير متاح.');
+    transferManager(room, target);
+    if (typeof callback === 'function') callback({ ok: true, state: publicRoomState(room, socket) });
+  });
+
+  socket.on('kickPlayer', (payload = {}, callback) => {
+    const room = getRoomForSocket(socket);
+    const target = room?.players.find((player) => player.id === payload.playerId);
+    if (!room || room.bossId !== socket.id) return sendError(socket, callback, 'طرد اللاعبين متاح للمدير فقط.');
+    if (room.status !== 'LOBBY') return sendError(socket, callback, 'يمكن طرد اللاعبين من غرفة الانتظار فقط.');
+    if (!target) return sendError(socket, callback, 'لم يتم العثور على اللاعب.');
+    target.isConnected = false;
+    const targetSocket = io.sockets.sockets.get(target.socketId);
+    targetSocket?.disconnect(true);
+    publishRoom(room);
+    if (typeof callback === 'function') callback({ ok: true, state: publicRoomState(room, socket) });
+  });
+
+  socket.on('banPlayer', (payload = {}, callback) => {
+    const room = getRoomForSocket(socket);
+    const target = room?.players.find((player) => player.id === payload.playerId);
+    if (!room || room.bossId !== socket.id) return sendError(socket, callback, 'منع اللاعبين متاح للمدير فقط.');
+    if (room.status !== 'LOBBY') return sendError(socket, callback, 'يمكن منع اللاعبين من غرفة الانتظار فقط.');
+    if (!target) return sendError(socket, callback, 'لم يتم العثور على اللاعب.');
+    room.bannedNames.add(target.name.toLocaleLowerCase());
+    const targetSocket = io.sockets.sockets.get(target.socketId);
+    room.players = room.players.filter((player) => player.id !== target.id);
+    targetSocket?.disconnect(true);
+    publishRoom(room);
+    if (typeof callback === 'function') callback({ ok: true, state: publicRoomState(room, socket) });
+  });
+
+  socket.on('restartRoom', (payload = {}, callback) => {
+    const room = getRoomForSocket(socket);
+    if (!room || room.bossId !== socket.id) return sendError(socket, callback, 'إعادة الغرفة متاحة للمدير فقط.');
+    if (room.status !== 'FINAL_CHALLENGE' || room.finalStage !== 'COMPLETE') return sendError(socket, callback, 'يمكن إعادة الغرفة بعد انتهاء اللعبة فقط.');
+    resetRoomToLobby(room);
+    if (typeof callback === 'function') callback({ ok: true, state: publicRoomState(room, socket) });
+  });
+
+  socket.on('startManagerVote', (payload = {}, callback) => {
+    const room = getRoomForSocket(socket);
+    const postGameVote = room?.status === 'FINAL_CHALLENGE' && room.finalStage === 'COMPLETE';
+    const managerAwayVote = room && !room.bossConnected
+      && ['LOBBY', 'MANAGER_PAUSED'].includes(room.status)
+      && Number.isFinite(room.managerVoteAvailableAt)
+      && Date.now() >= room.managerVoteAvailableAt;
+    if (!room || (!postGameVote && !managerAwayVote)) return sendError(socket, callback, 'لم يحن وقت التصويت على المدير بعد.');
+    if (room.managerVote) return sendError(socket, callback, 'يوجد تصويت مدير قائم بالفعل.');
+    room.managerVote = { votes: new Map() };
+    publishRoom(room);
+    if (typeof callback === 'function') callback({ ok: true, state: publicRoomState(room, socket) });
+  });
+
+  socket.on('castManagerVote', (payload = {}, callback) => {
+    const room = getRoomForSocket(socket);
+    const target = room?.players.find((player) => player.id === payload.playerId);
+    if (!room?.managerVote) return sendError(socket, callback, 'لا يوجد تصويت مدير قائم.');
+    if (!getRole(room, socket)) return sendError(socket, callback, 'انضم إلى الغرفة للتصويت.');
+    if (!target?.isConnected || target.isEliminated) return sendError(socket, callback, 'المرشح غير متاح للتصويت.');
+    room.managerVote.votes.set(socket.id, target.id);
+    if (!finishManagerVote(room)) publishRoom(room);
+    if (typeof callback === 'function') callback({ ok: true, state: publicRoomState(room, socket) });
   });
 
   socket.on('submitBossQuestion', (payload = {}, callback) => {
@@ -704,6 +949,7 @@ io.on('connection', (socket) => {
       stopVoiceSpeaking(room, socket.id);
       if (room.bossId === socket.id) {
         room.bossConnected = false;
+        pauseForManagerDeparture(room);
       } else {
         const player = getPlayerBySocket(room, socket.id);
         if (player) player.isConnected = false;
@@ -727,6 +973,7 @@ io.on('connection', (socket) => {
     stopVoiceSpeaking(room, socket.id);
     if (room.bossId === socket.id) {
       room.bossConnected = false;
+      pauseForManagerDeparture(room);
     } else {
       const player = getPlayerBySocket(room, socket.id);
       if (player) player.isConnected = false;
