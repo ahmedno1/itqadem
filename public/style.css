@@ -409,6 +409,91 @@ textarea {
   }
 }
 
+.private-trap-preview {
+  display: grid;
+  gap: 8px;
+  margin: 14px auto;
+  padding: 14px 16px;
+  border: 2px dashed #24795d;
+  border-radius: 12px;
+  background: #e6fff2;
+  text-align: center;
+}
+
+.private-trap-preview > span {
+  color: #17694f;
+  font-size: 0.8rem;
+  font-weight: 800;
+}
+
+.private-trap-preview strong {
+  font-size: 1.15rem;
+  line-height: 1.7;
+}
+
+.private-trap-preview small {
+  color: #3c6255;
+}
+
+.public-trap-card-wrap .trap-card {
+  width: min(100%, 420px);
+  height: 220px;
+}
+
+.public-trap-card-wrap .trap-card.is-flipped {
+  animation: trapCardFlip 0.9s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.public-trap-card-wrap .card-back strong {
+  font-size: 1.35rem;
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+}
+
+.defense-ending-countdown {
+  display: grid;
+  justify-items: center;
+  gap: 5px;
+  margin: 14px auto;
+  color: var(--dark-navy);
+}
+
+.defense-ending-countdown > span {
+  display: grid;
+  width: 88px;
+  height: 88px;
+  place-items: center;
+  border: 4px solid var(--dark-navy);
+  border-radius: 50%;
+  background: #ffd166;
+  box-shadow: 0 6px 0 var(--dark-navy);
+  font-size: 2.6rem;
+  font-weight: 900;
+  animation: endingCountPop 0.35s ease-out;
+}
+
+.defense-ending-countdown small {
+  font-weight: 700;
+}
+
+.is-new-defense-speaker .online-current-speaker {
+  animation: nextSpeakerReveal 0.65s ease-out both;
+}
+
+.is-defense-ending .public-trap-card-wrap {
+  animation: nextSpeakerReveal 0.55s ease-out both;
+}
+
+@keyframes endingCountPop {
+  from { transform: scale(0.7); opacity: 0.5; }
+  to { transform: scale(1); opacity: 1; }
+}
+
+@keyframes nextSpeakerReveal {
+  from { transform: translateY(16px) scale(0.94); opacity: 0; }
+  to { transform: translateY(0) scale(1); opacity: 1; }
+}
+
 .card-face {
   position: absolute;
   inset: 0;

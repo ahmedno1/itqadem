@@ -1,8 +1,8 @@
-const socket = io();
+const socket = window.AtqadamCommunication.createSocket();
 const app = document.getElementById('app');
 const topBarActions = document.getElementById('top-bar-actions');
 const ONLINE_SESSION_KEY = 'atqadam-online-session-v1';
-const EMOJI_USAGE_KEY = 'atqadam-emoji-usage-v1';
+const EMOJI_USAGE_KEY = window.AtqadamEmojiCatalog.STORAGE_KEY;
 
 let onlineSession = null;
 let onlineState = null;
@@ -15,6 +15,7 @@ let onlineServerOffset = 0;
 let onlineChatOpen = false;
 let onlineChatMessages = [];
 let onlineVoiceSpeakers = new Map();
+let onlinePreviousSpeakerId = null;
 let emojiCatalog = [];
 let stickerCatalog = [];
 let emojiUsage = {};
@@ -31,9 +32,9 @@ let voicePressed = false;
 let onlineSpeakingSent = false;
 
 try {
-  const emojiUsageState = JSON.parse(localStorage.getItem(EMOJI_USAGE_KEY) || '{}');
-  emojiUsage = emojiUsageState.counts && typeof emojiUsageState.counts === 'object' ? emojiUsageState.counts : {};
-  recentEmojis = Array.isArray(emojiUsageState.recent) ? emojiUsageState.recent : [];
+  const emojiUsageState = window.AtqadamEmojiCatalog.readUsage();
+  emojiUsage = emojiUsageState.counts;
+  recentEmojis = emojiUsageState.recent;
 } catch (error) {
   localStorage.removeItem(EMOJI_USAGE_KEY);
 }
@@ -102,12 +103,10 @@ function createPlayer(name = '') {
 }
 
 function resetPlayers() {
-  localGameState.players = [
-    createPlayer(),
-    createPlayer(),
-    createPlayer(),
-    createPlayer()
-  ];
+  localGameState.players = [createPlayer(), createPlayer()];
+  localGameState.originalPlayerCount = 2;
+  localGameState.trapWriterQueue = [];
+  localGameState.finalRound = false;
   saveGameState();
 }
 
@@ -313,9 +312,43 @@ function playOnlineOutcome(decision) {
   }
 }
 
+function primeOnlineAudio() {
+  try {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) return;
+    onlineAudioContext ||= new AudioContextClass();
+    onlineAudioContext.resume();
+  } catch (error) {
+    console.warn('Unable to enable online audio:', error);
+  }
+}
+
+function playDefenseCountdownTick() {
+  try {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) return;
+    onlineAudioContext ||= new AudioContextClass();
+    onlineAudioContext.resume();
+    const oscillator = onlineAudioContext.createOscillator();
+    const gain = onlineAudioContext.createGain();
+    const now = onlineAudioContext.currentTime;
+    oscillator.type = 'sine';
+    oscillator.frequency.value = 740;
+    gain.gain.setValueAtTime(0.0001, now);
+    gain.gain.exponentialRampToValueAtTime(0.08, now + 0.015);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.16);
+    oscillator.connect(gain);
+    gain.connect(onlineAudioContext.destination);
+    oscillator.start(now);
+    oscillator.stop(now + 0.17);
+  } catch (error) {
+    console.warn('Unable to play the defense countdown:', error);
+  }
+}
+
 function emitOnlineEvent(eventName, payload = {}) {
   return new Promise((resolve) => {
-    socket.timeout(10000).emit(eventName, payload, (timeoutError, response) => {
+    AtqadamCommunication.emitWithAck(socket, eventName, payload).then(({ timeoutError, response }) => {
       if (timeoutError) {
         setOnlineMessage('تعذر الاتصال بالخادم. تحقق من الاتصال ثم حاول مجدداً.');
         resolve(false);
@@ -351,6 +384,7 @@ function enterOnlineRoom(response) {
     name: response.name
   });
   onlineState = response.state;
+  onlinePreviousSpeakerId = null;
   onlineMessage = '';
   onlineEliminationResult = null;
   document.body.classList.add('game-started');
@@ -454,17 +488,14 @@ function sortedEmojiCatalog() {
 }
 
 function saveEmojiUsage() {
-  try {
-    localStorage.setItem(EMOJI_USAGE_KEY, JSON.stringify({ counts: emojiUsage, recent: recentEmojis }));
-  } catch (error) {
-    console.warn('Unable to save emoji usage:', error);
-  }
+  window.AtqadamEmojiCatalog.saveUsage({ counts: emojiUsage, recent: recentEmojis });
 }
 
 function recordEmojiUsage(emoji) {
-  emojiUsage[emoji] = (emojiUsage[emoji] || 0) + 1;
-  recentEmojis = [emoji, ...recentEmojis.filter((entry) => entry !== emoji)].slice(0, 40);
-  saveEmojiUsage();
+  const usage = { counts: emojiUsage, recent: recentEmojis };
+  window.AtqadamEmojiCatalog.recordUsage(usage, emoji);
+  emojiUsage = usage.counts;
+  recentEmojis = usage.recent;
   if (emojiPickerOpen) renderEmojiPicker();
 }
 
@@ -746,6 +777,9 @@ function renderOnlineRoom() {
   topBarActions.hidden = false;
 
   const state = onlineState;
+  const speakerId = state.currentSpeaker?.id || null;
+  const isNewDefenseSpeaker = state.status === 'DEFENSE' && speakerId && onlinePreviousSpeakerId && speakerId !== onlinePreviousSpeakerId;
+  if (state.status === 'DEFENSE' && speakerId) onlinePreviousSpeakerId = speakerId;
   const isBoss = state.role === 'boss';
   let screen = '';
 
@@ -754,10 +788,10 @@ function renderOnlineRoom() {
     screen = `${onlineHeader(state)}
       <h2>غرفة الانتظار</h2>
       <div class="room-code-box"><span>رمز الغرفة</span><strong>${escapeHtml(state.roomId)}</strong><button class="mini-btn" type="button" data-action="online-copy-code">نسخ الرمز</button></div>
-      <p class="online-instruction">شارك الرمز مع المتقدمين. يبدأ المدير اللعبة بعد انضمام أربعة متقدمين على الأقل.</p>
+      <p class="online-instruction">شارك الرمز مع المتقدمين. تبدأ اللعبة عند اتصال متقدمين اثنين على الأقل.</p>
       ${onlinePlayerList(state.players)}
       ${isBoss
-        ? `<button class="game-btn" type="button" data-action="online-start" ${connectedCount < 4 ? 'disabled' : ''}>ابدأ المقابلة (${connectedCount}/4)</button>`
+        ? `<button class="game-btn" type="button" data-action="online-start" ${connectedCount < 2 ? 'disabled' : ''}>ابدأ المقابلة (${connectedCount} متصل)</button>`
         : '<div class="online-waiting">بانتظار المدير لبدء المقابلة</div>'}`;
   } else if (state.status === 'BOSS_QUESTION') {
     screen = `${onlineHeader(state)}<span class="meta-badge">الجولة ${state.round}</span>
@@ -767,30 +801,43 @@ function renderOnlineRoom() {
         : '<div class="online-waiting">سيظهر السؤال هنا فور إرساله</div>'}`;
   } else if (state.status === 'SUBMIT_TRAPS') {
     const me = state.players.find((player) => player.id === state.meId);
+    const isTrapWriter = Boolean(me?.canSubmitTrap);
     screen = `${onlineHeader(state)}<span class="meta-badge">الجولة ${state.round}</span>
-      <h2>${isBoss ? 'إجابات المتقدمين' : 'أرسل إجابتك التوريطية'}</h2>
+      <h2>${isBoss ? 'إجابات التوريط' : isTrapWriter ? 'أرسل إجابتك التوريطية' : 'بانتظار إجابات المستبعدين'}</h2>
       <div class="info-box"><p>سؤال المدير</p><strong>${escapeHtml(state.currentQuestion)}</strong></div>
       ${isBoss
         ? `<div class="online-waiting">${state.players.filter((player) => player.hasSubmittedTrap).length} من ${state.players.filter((player) => player.isConnected).length} أجابوا</div>${onlinePlayerList(state.players)}`
+        : !isTrapWriter
+          ? '<div class="online-waiting">في هذه المرحلة يكتب اللاعبون المستبعدون إجابات التوريط، ثم يحاول الناجون تبريرها.</div>'
         : me?.hasSubmittedTrap
           ? '<div class="online-waiting">وصلت إجابتك. بانتظار بقية الغرفة.</div>'
           : '<div class="field-group"><label for="online-trap-answer">إجابتك</label><textarea id="online-trap-answer" maxlength="500" placeholder="اكتب إجابتك بسرية" required></textarea><button class="game-btn" type="button" data-action="online-send-trap">إرسال الإجابة</button></div>'}`;
   } else if (state.status === 'DEFENSE') {
     const currentSpeaker = state.currentSpeaker?.name || 'بانتظار متقدم متصل';
-    const count = state.turnEndsAt ? Math.max(0, Math.ceil((state.turnEndsAt - (Date.now() + onlineServerOffset)) / 1000)) : 0;
     if (state.isMyTurn) {
       screen = `${onlineHeader(state)}<span class="status-pill">دورك في التبرير</span>
-        <h2>${escapeHtml(currentSpeaker)}</h2>${voiceSpeakerBadge(state.currentSpeaker)}<div class="timer-box"><span data-online-countdown>${count}</span><span>ث</span></div>
-        <div class="trap-card-wrap"><div class="trap-card ${state.trapRevealed ? 'is-flipped' : ''}" data-action="online-reveal" role="button" tabindex="0" aria-label="كشف الإجابة التوريطية">
-          <div class="card-face card-front">${state.trapRevealed ? 'الإجابة المكشوفة' : 'بطاقتك مغلقة'}</div><div class="card-face card-back">${escapeHtml(state.myTrap || 'لا توجد إجابة مخصصة.')}</div>
+        <h2>${escapeHtml(currentSpeaker)}</h2>${voiceSpeakerBadge(state.currentSpeaker)}
+        ${!state.trapRevealed ? `<div class="private-trap-preview"><span>معاينة خاصة بك فقط</span><strong>${escapeHtml(state.myTrap || 'لا توجد إجابة مخصصة.')}</strong><small>ستظهر للجميع عند الكشف أو بعد 20 ثانية.</small></div>` : ''}
+        <div class="trap-card-wrap"><div class="trap-card ${state.trapRevealed ? 'is-flipped' : ''}" aria-label="بطاقة الإجابة التوريطية">
+          <div class="card-face card-front">${state.trapRevealed ? 'الإجابة التوريطية' : 'بطاقتك جاهزة للكشف'}</div><div class="card-face card-back"><strong>${escapeHtml(state.myTrap || 'لا توجد إجابة مخصصة.')}</strong></div>
         </div></div>
-        ${state.trapRevealed ? '<button class="game-btn" type="button" data-action="online-finish-defense">أنهيت التبرير</button>' : '<button class="secondary-btn" type="button" data-action="online-reveal">اكشف البطاقة</button>'}`;
+        ${state.trapRevealed ? '<div class="online-waiting">تابع التبرير؛ المدير ينهي دورك عند الاكتفاء.</div>' : '<button class="game-btn" type="button" data-action="online-reveal">كشف البطاقة للمدير والجميع</button>'}`;
     } else {
       screen = `${onlineHeader(state)}<span class="status-pill">بث مباشر للتبرير</span>
-        <h2>المتحدث الآن: ${escapeHtml(currentSpeaker)}</h2>${voiceSpeakerBadge(state.currentSpeaker)}<div class="timer-box"><span data-online-countdown>${count}</span><span>ث</span></div>
+        <h2>المتحدث الآن: ${escapeHtml(currentSpeaker)}</h2>${voiceSpeakerBadge(state.currentSpeaker)}
         <div class="info-box"><p>سؤال المدير</p><strong>${escapeHtml(state.currentQuestion)}</strong></div>
-        <div class="live-answer">${state.trapRevealed ? `<span>الإجابة التوريطية</span><strong>${escapeHtml(state.revealedTrap || '—')}</strong>` : '<span>البطاقة ما زالت مغلقة</span>'}</div>`;
+        <div class="trap-card-wrap public-trap-card-wrap"><div class="trap-card ${state.trapRevealed ? 'is-flipped' : ''}">
+          <div class="card-face card-front">${state.trapRevealed ? 'الإجابة التوريطية' : 'البطاقة ما زالت مغلقة'}</div><div class="card-face card-back"><strong>${escapeHtml(state.revealedTrap || '—')}</strong></div>
+        </div></div>
+        ${isBoss ? '<button class="game-btn" type="button" data-action="online-finish-defense">إنهاء تبرير اللاعب</button>' : ''}`;
     }
+  } else if (state.status === 'DEFENSE_ENDING') {
+    screen = `${onlineHeader(state)}<span class="status-pill">انتقال إلى المتقدم التالي</span>
+      <h2>انتهى التبرير</h2>${voiceSpeakerBadge(state.currentSpeaker)}
+      <div class="defense-ending-countdown"><span data-defense-ending-countdown>3</span><small>استعدوا للدور التالي</small></div>
+      <div class="trap-card-wrap public-trap-card-wrap"><div class="trap-card is-flipped">
+        <div class="card-face card-front">انتهى الدور</div><div class="card-face card-back"><strong>${escapeHtml(state.revealedTrap || '—')}</strong></div>
+      </div></div>`;
   } else if (state.status === 'ELIMINATION') {
     const eliminated = onlineEliminationResult?.eliminatedPlayerName
       || state.players.find((player) => player.id === state.eliminatedPlayerId)?.name;
@@ -801,42 +848,41 @@ function renderOnlineRoom() {
       ${isBoss && !eliminated ? onlinePlayerList(state.players, true) : '<div class="online-waiting">سيبدأ المدير الجولة التالية بعد إعلان النتيجة</div>'}`;
   } else if (state.status === 'FINAL_CHALLENGE') {
     const finalist = state.finalist || state.players.find((player) => !player.isEliminated);
-    const finalQuestionPanel = ['DEFENSE', 'DECISION', 'COMPLETE'].includes(state.finalStage)
-      ? `<div class="info-box"><p>السؤال النهائي</p><strong>${escapeHtml(state.finalQuestion)}</strong></div>`
-      : '';
-    const finalAction = state.finalStage === 'QUESTION' && isBoss
-      ? '<div class="field-group"><label for="online-final-question">السؤال النهائي</label><textarea id="online-final-question" maxlength="500" placeholder="اكتب السؤال الأخير" required></textarea><button class="game-btn" type="button" data-action="online-send-final-question">إرسال السؤال</button></div>'
-      : state.finalStage === 'DEFENSE' && state.meId === finalist?.id
-        ? `<div class="field-group"><label for="online-final-defense">دفاعك النهائي</label><textarea id="online-final-defense" maxlength="1000" placeholder="اكتب دفاعك" required></textarea><button class="game-btn" type="button" data-action="online-send-final-defense">إرسال الدفاع</button></div>`
-        : state.finalStage === 'DEFENSE'
-          ? '<div class="online-waiting">المتقدم الأخير يجهز دفاعه</div>'
-        : state.finalStage === 'DECISION' && isBoss
-          ? `<div class="result-box"><p>دفاع ${escapeHtml(finalist?.name || 'المتقدم الأخير')}</p><strong>${escapeHtml(state.finalDefense)}</strong><p class="final-decision-prompt">هل يبقى في الوظيفة أم يُستبعد هو أيضاً؟</p></div><div class="footer-actions"><button class="game-btn" type="button" data-action="online-final-decision" data-decision="accept">الإبقاء عليه في الوظيفة</button><button class="secondary-btn" type="button" data-action="online-final-decision" data-decision="reject">استبعاده هو أيضاً</button></div>`
+    const finalAction = state.finalStage === 'DECISION' && isBoss
+      ? `<div class="info-box"><p>سؤال الجولة الأخيرة</p><strong>${escapeHtml(state.finalQuestion || state.currentQuestion)}</strong></div><div class="result-box"><p>الناجي الأخير من جولات التبرير</p><strong>${escapeHtml(finalist?.name || '—')}</strong><p class="final-decision-prompt">هل فاز المتقدم الأخير أم يُستبعد مع الباقين؟</p></div><div class="footer-actions"><button class="game-btn" type="button" data-action="online-final-decision" data-decision="accept">إعلان فوزه</button><button class="secondary-btn" type="button" data-action="online-final-decision" data-decision="reject">استبعاده مع الباقين</button></div>`
           : state.finalStage === 'DECISION'
-            ? `<div class="result-box"><p>دفاع ${escapeHtml(finalist?.name || 'المتقدم الأخير')}</p><strong>${escapeHtml(state.finalDefense)}</strong></div><div class="online-waiting">المدير يختار الآن الإبقاء على المتقدم أو استبعاده</div>`
+            ? `<div class="info-box"><p>سؤال الجولة الأخيرة</p><strong>${escapeHtml(state.finalQuestion || state.currentQuestion)}</strong></div><div class="online-waiting">المدير يقرر الآن إن كان ${escapeHtml(finalist?.name || 'المتقدم الأخير')} قد فاز أم سيُستبعد مع الباقين</div>`
           : state.finalStage === 'COMPLETE'
-            ? `<div class="victory-panel ${state.finalDecision === 'accept' ? 'accepted' : 'rejected'}"><span>${state.finalDecision === 'accept' ? 'بقي في الوظيفة' : 'استُبعد من الوظيفة'}</span><strong>${escapeHtml(finalist?.name || 'المتقدم الأخير')}</strong></div>`
-            : '<div class="online-waiting">بانتظار الخطوة التالية من المدير والمتقدم الأخير</div>';
-    screen = `${onlineHeader(state)}<span class="status-pill">التحدي النهائي</span><h2>المتقدم الأخير: ${escapeHtml(finalist?.name || '—')}</h2>${finalQuestionPanel}${finalAction}`;
+            ? finalist
+              ? `<div class="victory-panel ${state.finalDecision === 'accept' ? 'accepted' : 'rejected'}"><span>${state.finalDecision === 'accept' ? 'فاز باللعبة' : 'استُبعد مع الباقين'}</span><strong>${escapeHtml(finalist.name)}</strong></div>`
+              : '<div class="victory-panel rejected"><span>تم استبعاد جميع المتقدمين</span><strong>لا يوجد فائز</strong></div>'
+            : '<div class="online-waiting">بانتظار قرار الجولة الأخيرة</div>';
+    screen = `${onlineHeader(state)}<span class="status-pill">حسم الجولة الأخيرة</span><h2>الناجي الأخير: ${escapeHtml(finalist?.name || 'لا يوجد لاعب باقٍ')}</h2>${finalAction}`;
   }
 
-  app.innerHTML = `<section class="screen-card online-room-screen">${screen}<div id="online-message" class="online-message" ${onlineMessage ? '' : 'hidden'}>${escapeHtml(onlineMessage)}</div>${onlineSocialTools(state)}</section>`;
+  app.innerHTML = `<section class="screen-card online-room-screen${isNewDefenseSpeaker ? ' is-new-defense-speaker' : ''}${state.status === 'DEFENSE_ENDING' ? ' is-defense-ending' : ''}">${screen}<div id="online-message" class="online-message" ${onlineMessage ? '' : 'hidden'}>${escapeHtml(onlineMessage)}</div>${onlineSocialTools(state)}</section>`;
   renderEmojiPicker();
   renderStickerPicker();
   syncVoiceConnections(state);
-  startOnlineCountdown(state.turnEndsAt);
+  if (state.status === 'DEFENSE_ENDING') {
+    startOnlineCountdown(state.defenseEndsAt, '[data-defense-ending-countdown]', true);
+  }
 }
 
-function startOnlineCountdown(turnEndsAt) {
+function startOnlineCountdown(turnEndsAt, selector = '[data-online-countdown]', withSound = false) {
   clearOnlineCountdown();
   if (!turnEndsAt) return;
+  let previousCount = null;
   const updateCountdown = () => {
-    const element = document.querySelector('[data-online-countdown]');
+    const element = document.querySelector(selector);
     if (!element) {
       clearOnlineCountdown();
       return;
     }
-    element.textContent = String(Math.max(0, Math.ceil((turnEndsAt - (Date.now() + onlineServerOffset)) / 1000)));
+    const count = Math.max(0, Math.ceil((turnEndsAt - (Date.now() + onlineServerOffset)) / 1000));
+    element.textContent = String(count);
+    if (withSound && count > 0 && count !== previousCount) playDefenseCountdownTick();
+    previousCount = count;
   };
   updateCountdown();
   onlineCountdownTimer = setInterval(updateCountdown, 250);
@@ -972,7 +1018,8 @@ function buildBossQuestionScreen() {
 }
 
 function buildHandoffScreen() {
-  const currentPlayer = localGameState.players[localGameState.currentPlayerIndex];
+  const writerId = localGameState.trapWriterQueue[localGameState.currentPlayerIndex];
+  const currentPlayer = localGameState.players.find((player) => player.id === writerId);
   if (!currentPlayer) {
     finishTrapPhase();
     return;
@@ -980,10 +1027,11 @@ function buildHandoffScreen() {
 
   localGameState.phase = 'handoff';
   saveGameState();
+  const writerRole = currentPlayer.status === 'eliminated' ? 'المستبعد يكتب التوريط' : 'المتقدم يكتب التوريط';
 
   app.innerHTML = `
     <section class="screen-card handoff-screen">
-      <div class="status-pill">مرّر الجهاز</div>
+      <div class="status-pill">${writerRole}</div>
       <h2>مرّر الجهاز إلى</h2>
       <div class="handoff-box">
         <p>اللاعب التالي</p>
@@ -1000,7 +1048,8 @@ function buildHandoffScreen() {
 }
 
 function buildTrapInputScreen() {
-  const currentPlayer = localGameState.players[localGameState.currentPlayerIndex];
+  const writerId = localGameState.trapWriterQueue[localGameState.currentPlayerIndex];
+  const currentPlayer = localGameState.players.find((player) => player.id === writerId);
   if (!currentPlayer) {
     finishTrapPhase();
     return;
@@ -1008,11 +1057,12 @@ function buildTrapInputScreen() {
 
   localGameState.phase = 'trap-input';
   saveGameState();
+  const writerRole = currentPlayer.status === 'eliminated' ? 'إجابة توريط من لاعب مستبعد' : 'إجابة توريط';
 
   app.innerHTML = `
     <section class="screen-card">
       <div class="player-meta">
-        <span class="status-pill">إجابة التوريط</span>
+        <span class="status-pill">${writerRole}</span>
       </div>
 
       <h2>${escapeHtml(currentPlayer.Name)}</h2>
@@ -1171,22 +1221,22 @@ function buildFinalDefenseScreen() {
 function buildBossDecisionScreen() {
   localGameState.phase = 'decision';
   saveGameState();
+  const finalist = getActivePlayers()[0];
 
   app.innerHTML = `
     <section class="screen-card final-screen">
-      <div class="status-pill">حسم المدير</div>
-      <h2>هل يبقى المتقدم الأخير أم يُستبعد؟</h2>
+      <div class="status-pill">حسم الجولة الأخيرة</div>
+      <h2>هل فاز المتقدم الأخير أم يُستبعد مع الباقين؟</h2>
       <div class="result-box">
-        <p>السؤال النهائي:</p>
+        <p>سؤال الجولة:</p>
         <strong>${escapeHtml(localGameState.currentQuestion)}</strong>
-        <br /><br />
-        <p>دفاع المتقدم:</p>
-        <strong>${escapeHtml(localGameState.finalDefenseText || 'لم يتم إدخال دفاع.')}</strong>
+        <p>الناجي الأخير:</p>
+        <strong>${escapeHtml(finalist?.Name || '—')}</strong>
       </div>
 
       <div class="footer-actions">
-        <button class="game-btn" type="button" data-action="final-decision" data-result="accept">الإبقاء عليه في الوظيفة</button>
-        <button class="secondary-btn" type="button" data-action="final-decision" data-result="reject">استبعاده هو أيضاً</button>
+        <button class="game-btn" type="button" data-action="final-decision" data-result="accept">إعلان فوزه</button>
+        <button class="secondary-btn" type="button" data-action="final-decision" data-result="reject">استبعاده مع الباقين</button>
       </div>
 
       ${buildQuickActions()}
@@ -1223,6 +1273,7 @@ function validatePlayerNames() {
 
   localGameState.bossName = bossName;
   localGameState.players = rawNames.map((name) => createPlayer(name));
+  localGameState.originalPlayerCount = localGameState.players.length;
   localGameState.currentRound = 1;
   localGameState.currentQuestion = '';
   localGameState.turnIndex = 0;
@@ -1232,14 +1283,16 @@ function validatePlayerNames() {
   localGameState.finalWinner = '';
   localGameState.finalistId = '';
   localGameState.lastDecision = '';
+  localGameState.trapWriterQueue = [];
+  localGameState.finalRound = false;
   saveGameState();
   return true;
 }
 
 function finishTrapPhase() {
   const trapEntries = localGameState.players
-    .filter((player) => player.submittedTrap && player.submittedTrap.trim())
-    .map((player) => ({ author: player.Name, text: player.submittedTrap.trim() }));
+    .filter((player) => localGameState.trapWriterQueue.includes(player.id) && player.submittedTrap && player.submittedTrap.trim())
+    .map((player) => ({ authorId: player.id, text: player.submittedTrap.trim() }));
 
   const activePlayers = getActivePlayers();
   const usedKeys = new Set();
@@ -1248,21 +1301,21 @@ function finishTrapPhase() {
     player.assignedTrap = '';
     const shuffledEntries = shuffleArray(trapEntries);
     const match = shuffledEntries.find((entry) => {
-      const key = `${entry.author}::${entry.text}`;
-      return entry.author !== player.Name && !usedKeys.has(key);
+      const key = `${entry.authorId}::${entry.text}`;
+      return entry.authorId !== player.id && !usedKeys.has(key);
     });
 
     if (match) {
       player.assignedTrap = match.text;
-      usedKeys.add(`${match.author}::${match.text}`);
+      usedKeys.add(`${match.authorId}::${match.text}`);
     } else {
       const fallback = trapEntries.find(
-        (entry) => entry.author !== player.Name && !usedKeys.has(`${entry.author}::${entry.text}`)
+        (entry) => entry.authorId !== player.id && !usedKeys.has(`${entry.authorId}::${entry.text}`)
       );
 
       if (fallback) {
         player.assignedTrap = fallback.text;
-        usedKeys.add(`${fallback.author}::${fallback.text}`);
+        usedKeys.add(`${fallback.authorId}::${fallback.text}`);
       } else {
         player.assignedTrap = 'لا توجد إجابة مناسبة في هذه الجولة.';
       }
@@ -1314,9 +1367,16 @@ function advanceDefense() {
 
   if (localGameState.turnIndex >= localGameState.defenseQueue.length - 1) {
     clearTimer();
-    localGameState.phase = 'elimination';
-    saveGameState();
-    buildBossEliminationScreen();
+    if (localGameState.finalRound && getActivePlayers().length === 1) {
+      localGameState.phase = 'decision';
+      localGameState.finalistId = getActivePlayers()[0].id;
+      saveGameState();
+      buildBossDecisionScreen();
+    } else {
+      localGameState.phase = 'elimination';
+      saveGameState();
+      buildBossEliminationScreen();
+    }
     return;
   }
 
@@ -1348,11 +1408,14 @@ function evaluateElimination(playerName) {
 
   const activePlayers = getActivePlayers();
   if (activePlayers.length <= 1) {
-    localGameState.phase = 'final';
     localGameState.finalistId = activePlayers[0]?.id || '';
-    localGameState.currentQuestion = '';
-    saveGameState();
-    buildFinalChallengeScreen();
+    localGameState.finalDefenseText = '';
+    if (activePlayers.length === 1) {
+      localGameState.finalRound = true;
+      startNextRound();
+    } else {
+      finalizeDecision('reject');
+    }
     return;
   }
 
@@ -1385,6 +1448,18 @@ function saveBossQuestion() {
   localGameState.currentQuestion = bossQuestion;
   localGameState.phase = 'trap';
   localGameState.currentPlayerIndex = 0;
+  const activePlayers = getActivePlayers();
+  const eliminatedPlayers = localGameState.players.filter((player) => player.status === 'eliminated');
+  const originalCount = localGameState.originalPlayerCount || localGameState.players.length;
+  const reverseDirection = window.AtqadamGameRules.shouldUseEliminatedAuthors({
+    round: localGameState.currentRound,
+    finalRound: localGameState.finalRound,
+    activeCount: activePlayers.length,
+    originalPlayerCount: originalCount
+  });
+  localGameState.trapWriterQueue = (reverseDirection
+    ? eliminatedPlayers
+    : localGameState.players.filter((player) => player.status === 'active' || player.status === 'eliminated')).map((player) => player.id);
 
   localGameState.players.forEach((player) => {
     player.submittedTrap = '';
@@ -1397,7 +1472,8 @@ function saveBossQuestion() {
 }
 
 function handleReadyHandoff() {
-  const currentPlayer = localGameState.players[localGameState.currentPlayerIndex];
+  const writerId = localGameState.trapWriterQueue[localGameState.currentPlayerIndex];
+  const currentPlayer = localGameState.players.find((player) => player.id === writerId);
   if (!currentPlayer) {
     finishTrapPhase();
     return;
@@ -1434,7 +1510,7 @@ function handleTrapSave() {
   localGameState.currentPlayerIndex += 1;
   saveGameState();
 
-  if (localGameState.currentPlayerIndex < localGameState.players.length) {
+  if (localGameState.currentPlayerIndex < localGameState.trapWriterQueue.length) {
     buildHandoffScreen();
   } else {
     finishTrapPhase();
@@ -1487,17 +1563,25 @@ function finalizeDecision(result) {
     finalist.status = 'eliminated';
   }
   localGameState.lastDecision = result;
-  localGameState.finalWinner = result === 'accept' ? (finalist?.Name || 'المتقدم') : localGameState.bossName || 'المدير';
+  localGameState.finalistId = finalist?.id || localGameState.finalistId || '';
+  localGameState.finalWinner = result === 'accept' ? (finalist?.Name || 'المتقدم') : '';
   localGameState.phase = 'completed';
   saveGameState();
+
+  const outcomeText = result === 'accept'
+    ? `فاز ${escapeHtml(finalist?.Name || 'المتقدم')} باللعبة.`
+    : finalist
+      ? `تم استبعاد ${escapeHtml(finalist.Name)} مع الباقين؛ لا يوجد فائز.`
+      : 'تم استبعاد جميع المتقدمين؛ لا يوجد فائز.';
+  const outcomeName = result === 'accept' ? localGameState.finalWinner : finalist?.Name || 'لا يوجد فائز';
 
   app.innerHTML = `
     <section class="screen-card final-screen">
       <div class="status-pill">نهاية اللعبة</div>
       <h2>النتيجة النهائية</h2>
       <div class="result-box">
-        <p>${result === 'accept' ? `تم الإبقاء على ${escapeHtml(finalist?.Name || 'المتقدم')} في الوظيفة.` : `تم استبعاد ${escapeHtml(finalist?.Name || 'المتقدم')} أيضاً.`}</p>
-        <strong>${escapeHtml(localGameState.finalWinner)}</strong>
+        <p>${outcomeText}</p>
+        <strong>${escapeHtml(outcomeName)}</strong>
       </div>
 
       <div class="footer-actions">
@@ -1591,15 +1675,18 @@ function restoreGameSession() {
         const finalist = savedState.players.find((player) => player.id === savedState.finalistId)
           || savedState.players.find((player) => player.status === 'active');
         const outcomeText = savedState.lastDecision === 'accept'
-          ? `تم الإبقاء على ${escapeHtml(finalist?.Name || 'المتقدم')} في الوظيفة.`
-          : `تم استبعاد ${escapeHtml(finalist?.Name || 'المتقدم')} أيضاً.`;
+          ? `فاز ${escapeHtml(finalist?.Name || 'المتقدم')} باللعبة.`
+          : finalist
+            ? `تم استبعاد ${escapeHtml(finalist.Name)} مع الباقين؛ لا يوجد فائز.`
+            : 'تم استبعاد جميع المتقدمين؛ لا يوجد فائز.';
+        const outcomeName = savedState.lastDecision === 'accept' ? savedState.finalWinner : finalist?.Name || 'لا يوجد فائز';
       app.innerHTML = `
         <section class="screen-card final-screen">
           <div class="status-pill">نهاية اللعبة</div>
           <h2>النتيجة النهائية</h2>
           <div class="result-box">
             <p>${outcomeText}</p>
-            <strong>${escapeHtml(savedState.finalWinner)}</strong>
+            <strong>${escapeHtml(outcomeName)}</strong>
           </div>
           <div class="footer-actions">
             <button class="game-btn" type="button" data-action="restart-game">ابدأ لعبة جديدة</button>
@@ -1649,7 +1736,8 @@ function handleGameAction(event) {
       emitOnlineEvent('revealTrap');
       break;
     case 'online-finish-defense':
-      emitOnlineEvent('finishDefense');
+      primeOnlineAudio();
+      emitOnlineEvent('finishDefenseTurn');
       break;
     case 'online-eliminate':
       emitOnlineEvent('eliminatePlayer', { playerId: button.dataset.playerId });

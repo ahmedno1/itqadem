@@ -3,19 +3,22 @@ const express = require('express');
 const http = require('http');
 const path = require('path');
 const { Server } = require('socket.io');
+const gameRules = require('./shared/gameRules');
 
 const app = express();
 const server = http.createServer(app);
 const PORT = Number(process.env.PORT) || 3000;
 const ROOM_CODE_CHARACTERS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const ROOM_CLEANUP_DELAY = 30 * 60 * 1000;
-const DEFENSE_DURATION = 60 * 1000;
+const PRIVATE_PREVIEW_DURATION = 20 * 1000;
+const DEFENSE_ENDING_DURATION = 3 * 1000;
 const ELIMINATION_PAUSE = 2500;
 const rooms = new Map();
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 app.use('/img', express.static(path.join(__dirname, 'img')));
+app.use('/shared', express.static(path.join(__dirname, 'shared')));
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', message: 'Game server is running' });
@@ -95,13 +98,15 @@ function publicRoomState(room, socket) {
       name: player.name,
       isEliminated: player.isEliminated,
       isConnected: player.isConnected,
-      hasSubmittedTrap: room.trapAnswers.has(player.id)
+      hasSubmittedTrap: room.trapAnswers.has(player.id),
+      canSubmitTrap: room.trapAuthorIds.includes(player.id)
     })),
     currentQuestion: room.currentQuestion,
     round: room.round,
     turnIndex: room.turnIndex,
     currentSpeaker: speakerPlayer ? { id: speakerPlayer.id, name: speakerPlayer.name, socketId: speakerPlayer.socketId } : null,
     turnEndsAt: room.turnEndsAt,
+    defenseEndsAt: room.defenseEndsAt,
     trapRevealed: room.trapRevealed,
     revealedTrap: room.trapRevealed ? room.assignedTraps.get(speaker) || '' : '',
     finalStage: room.finalStage,
@@ -109,6 +114,9 @@ function publicRoomState(room, socket) {
     finalQuestion: room.finalQuestion,
     finalDefense: room.finalDefense,
     finalDecision: room.finalDecision,
+    finalRound: room.finalRound,
+    trapAuthorIds: room.trapAuthorIds,
+    trapTargetIds: room.trapTargetIds,
     eliminatedPlayerId: room.eliminatedPlayerId,
     voicePeers: [
       ...(room.bossConnected ? [{ socketId: room.bossId, name: room.bossName, role: 'boss' }] : []),
@@ -121,7 +129,7 @@ function publicRoomState(room, socket) {
     role,
     meId: me?.id || (role === 'boss' ? room.bossId : null),
     isMyTurn: Boolean(me && speaker === me.id),
-    myTrap: me && speaker === me.id ? room.assignedTraps.get(me.id) || '' : ''
+    myTrap: room.status === 'DEFENSE' && me && speaker === me.id ? room.assignedTraps.get(me.id) || '' : ''
   };
 }
 
@@ -149,23 +157,45 @@ function shuffle(items) {
   return shuffled;
 }
 
-function distributeTraps(room, participants) {
-  const answers = participants.map((player) => ({ authorId: player.id, text: room.trapAnswers.get(player.id) }));
+function distributeTraps(room, targets, authors) {
+  const answers = authors.map((player) => ({ authorId: player.id, text: room.trapAnswers.get(player.id) }));
+
+  if (authors.length < targets.length) return false;
+
+  if (authors.some((author) => !targets.some((target) => target.id === author.id))) {
+    const shuffledAnswers = shuffle(answers);
+    targets.forEach((target, index) => room.assignedTraps.set(target.id, shuffledAnswers[index % shuffledAnswers.length].text));
+    return true;
+  }
 
   for (let attempt = 0; attempt < 64; attempt += 1) {
     const shuffledAnswers = shuffle(answers);
-    if (participants.every((player, index) => player.id !== shuffledAnswers[index].authorId)) {
-      participants.forEach((player, index) => room.assignedTraps.set(player.id, shuffledAnswers[index].text));
+    if (targets.every((target, index) => target.id !== shuffledAnswers[index].authorId)) {
+      targets.forEach((target, index) => room.assignedTraps.set(target.id, shuffledAnswers[index].text));
       return true;
     }
   }
 
-  const offset = crypto.randomInt(1, participants.length);
-  participants.forEach((player, index) => {
+  const offset = crypto.randomInt(1, authors.length);
+  targets.forEach((target, index) => {
     const answer = answers[(index + offset) % answers.length];
-    room.assignedTraps.set(player.id, answer.text);
+    room.assignedTraps.set(target.id, answer.text);
   });
   return true;
+}
+
+function configureTrapDirection(room) {
+  const active = activePlayers(room);
+  const eliminated = room.players.filter((player) => player.isEliminated && player.isConnected);
+  const originalCount = room.originalPlayerCount || room.players.length;
+  const reverseDirection = gameRules.shouldUseEliminatedAuthors({
+    round: room.round,
+    finalRound: room.finalRound,
+    activeCount: active.length,
+    originalPlayerCount: originalCount
+  });
+  room.trapTargetIds = active.map((player) => player.id);
+  room.trapAuthorIds = (reverseDirection ? eliminated : connectedPlayers(room)).map((player) => player.id);
 }
 
 function clearRoomTimer(room) {
@@ -189,6 +219,9 @@ function startDefenseTurn(room) {
   room.defenseOrder = activePlayers(room).map((player) => player.id);
   room.turnIndex = 0;
   room.trapRevealed = false;
+  room.defenseEndsAt = null;
+  room.trapAuthorIds = [];
+  room.trapTargetIds = [];
 
   if (room.defenseOrder.length === 0) {
     room.turnEndsAt = null;
@@ -207,26 +240,58 @@ function beginCurrentDefense(room) {
     return;
   }
 
+  room.status = 'DEFENSE';
   room.trapRevealed = false;
-  room.turnEndsAt = Date.now() + DEFENSE_DURATION;
+  room.turnEndsAt = null;
+  room.defenseEndsAt = null;
   publishRoom(room);
   const playerSocket = io.sockets.sockets.get(player.socketId);
   playerSocket?.emit('privateTrap', { text: room.assignedTraps.get(player.id) || '' });
-  room.timer = setTimeout(() => advanceDefense(room), DEFENSE_DURATION);
+  room.timer = setTimeout(() => revealCurrentDefenseTrap(room, true), PRIVATE_PREVIEW_DURATION);
+}
+
+function revealCurrentDefenseTrap(room, automatic = false) {
+  if (room.status !== 'DEFENSE' || room.trapRevealed) return false;
+  clearRoomTimer(room);
+  const playerId = room.defenseOrder[room.turnIndex];
+  const player = room.players.find((entry) => entry.id === playerId);
+  if (!player) return false;
+
+  room.trapRevealed = true;
+  io.to(room.roomId).emit('trapRevealed', {
+    playerId: player.id,
+    playerName: player.name,
+    answer: room.assignedTraps.get(player.id) || '',
+    automatic
+  });
+  publishRoom(room);
+  return true;
 }
 
 function beginElimination(room) {
   clearRoomTimer(room);
+  if (room.finalRound && activePlayers(room).length === 1) {
+    room.status = 'FINAL_CHALLENGE';
+    room.finalStage = 'DECISION';
+    room.finalistId = activePlayers(room)[0].id;
+    room.finalQuestion = room.currentQuestion;
+    room.turnEndsAt = null;
+    room.defenseEndsAt = null;
+    publishRoom(room);
+    return;
+  }
   room.status = 'ELIMINATION';
   room.turnEndsAt = null;
+  room.defenseEndsAt = null;
   room.defenseOrder = [];
   room.turnIndex = 0;
   publishRoom(room);
 }
 
 function advanceDefense(room) {
-  if (room.status !== 'DEFENSE') return;
+  if (!['DEFENSE', 'DEFENSE_ENDING'].includes(room.status)) return;
   clearRoomTimer(room);
+  room.defenseEndsAt = null;
   const currentPlayerId = room.defenseOrder[room.turnIndex];
   if (currentPlayerId) room.assignedTraps.delete(currentPlayerId);
   room.trapRevealed = false;
@@ -244,10 +309,11 @@ function advanceDefense(room) {
 
 function tryStartDefense(room) {
   if (room.status !== 'SUBMIT_TRAPS') return;
-  const participants = connectedPlayers(room);
-  if (participants.length < 2 || !participants.every((player) => room.trapAnswers.has(player.id))) return;
+  const targets = activePlayers(room).filter((player) => room.trapTargetIds.includes(player.id));
+  const authors = connectedPlayers(room).filter((player) => room.trapAuthorIds.includes(player.id));
+  if (targets.length === 0 || authors.length === 0 || !authors.every((player) => room.trapAnswers.has(player.id))) return;
 
-  distributeTraps(room, participants);
+  if (!distributeTraps(room, targets, authors)) return;
   startDefenseTurn(room);
 }
 
@@ -267,6 +333,8 @@ function resetForNextRound(room) {
   room.finalQuestion = '';
   room.finalDefense = '';
   room.finalDecision = null;
+  room.finalRound = false;
+  configureTrapDirection(room);
   publishRoom(room);
 }
 
@@ -301,14 +369,19 @@ io.on('connection', (socket) => {
       bossConnected: true,
       status: 'LOBBY',
       players: [],
+      originalPlayerCount: 0,
       currentQuestion: '',
       turnIndex: 0,
       round: 1,
       defenseOrder: [],
       turnEndsAt: null,
+      defenseEndsAt: null,
       trapRevealed: false,
       trapAnswers: new Map(),
       assignedTraps: new Map(),
+      trapAuthorIds: [],
+      trapTargetIds: [],
+      finalRound: false,
       finalStage: null,
       finalistId: null,
       finalQuestion: '',
@@ -338,8 +411,6 @@ io.on('connection', (socket) => {
     if (room.bossName.toLocaleLowerCase() === normalized || room.players.some((player) => player.name.toLocaleLowerCase() === normalized)) {
       return sendError(socket, callback, 'هذا الاسم مستخدم في الغرفة بالفعل. اختر اسماً آخر.');
     }
-    if (room.players.length >= 8) return sendError(socket, callback, 'الغرفة مكتملة (8 متقدمين كحد أقصى).');
-
     const player = {
       id: crypto.randomUUID(),
       socketId: socket.id,
@@ -394,9 +465,11 @@ io.on('connection', (socket) => {
     const room = getRoomForSocket(socket);
     if (!room || room.bossId !== socket.id) return sendError(socket, callback, 'هذا الإجراء متاح للمدير فقط.');
     if (room.status !== 'LOBBY') return sendError(socket, callback, 'بدأت اللعبة بالفعل.');
-    if (activePlayers(room).length < 4) return sendError(socket, callback, 'تحتاج الغرفة إلى أربعة متقدمين متصلين على الأقل.');
+    if (activePlayers(room).length < 2) return sendError(socket, callback, 'تحتاج الغرفة إلى متقدمين متصلين على الأقل لبدء اللعبة.');
     room.status = 'BOSS_QUESTION';
     room.round = 1;
+    room.originalPlayerCount = activePlayers(room).length;
+    room.finalRound = false;
     publishRoom(room);
     replyWithRoom(socket, callback, room);
   });
@@ -411,6 +484,7 @@ io.on('connection', (socket) => {
     room.currentQuestion = question;
     room.trapAnswers.clear();
     room.assignedTraps.clear();
+    configureTrapDirection(room);
     room.status = 'SUBMIT_TRAPS';
     publishRoom(room);
     replyWithRoom(socket, callback, room);
@@ -421,6 +495,7 @@ io.on('connection', (socket) => {
     const player = room && getPlayerBySocket(room, socket.id);
     if (!room || !player) return sendError(socket, callback, 'انضم إلى الغرفة كمتقدم أولاً.');
     if (room.status !== 'SUBMIT_TRAPS') return sendError(socket, callback, 'الغرفة لا تستقبل إجابات في هذه المرحلة.');
+    if (!room.trapAuthorIds.includes(player.id)) return sendError(socket, callback, 'في هذه الجولة يكتب المستبعدون إجابات التوريط.');
     const answer = typeof payload.answer === 'string' ? payload.answer.trim() : '';
     if (!validateText(answer, 500)) return sendError(socket, callback, 'اكتب إجابة لا تتجاوز 500 حرف.');
     if (room.trapAnswers.has(player.id)) return sendError(socket, callback, 'تم إرسال إجابتك بالفعل في هذه الجولة.');
@@ -521,26 +596,22 @@ io.on('connection', (socket) => {
       return sendError(socket, callback, 'لا يمكنك كشف البطاقة في هذا الدور.');
     }
     if (room.trapRevealed) return sendError(socket, callback, 'تم كشف البطاقة بالفعل.');
-    room.trapRevealed = true;
-    const answer = room.assignedTraps.get(player.id) || '';
-    io.to(room.roomId).emit('trapRevealed', {
-      playerId: player.id,
-      playerName: player.name,
-      answer,
-      turnEndsAt: room.turnEndsAt
-    });
-    publishRoom(room);
+    revealCurrentDefenseTrap(room, false);
     if (typeof callback === 'function') callback({ ok: true });
   });
 
-  socket.on('finishDefense', (payload, callback) => {
+  socket.on('finishDefenseTurn', (payload, callback) => {
     const room = getRoomForSocket(socket);
-    const player = room && getPlayerBySocket(room, socket.id);
-    if (!room || room.status !== 'DEFENSE' || !player || room.defenseOrder[room.turnIndex] !== player.id) {
-      return sendError(socket, callback, 'لا يمكنك إنهاء هذا الدور.');
-    }
+    if (!room || room.bossId !== socket.id) return sendError(socket, callback, 'إنهاء التبرير متاح للمدير فقط.');
+    if (room.status !== 'DEFENSE') return sendError(socket, callback, 'لا يوجد تبرير نشط لإنهائه.');
+    if (!room.trapRevealed) revealCurrentDefenseTrap(room, true);
+    clearRoomTimer(room);
+    room.status = 'DEFENSE_ENDING';
+    room.defenseEndsAt = Date.now() + DEFENSE_ENDING_DURATION;
+    publishRoom(room);
+    io.to(room.roomId).emit('defenseEnding', { endsAt: room.defenseEndsAt, duration: DEFENSE_ENDING_DURATION });
     if (typeof callback === 'function') callback({ ok: true });
-    advanceDefense(room);
+    room.timer = setTimeout(() => advanceDefense(room), DEFENSE_ENDING_DURATION);
   });
 
   socket.on('eliminatePlayer', (payload = {}, callback) => {
@@ -566,14 +637,19 @@ io.on('connection', (socket) => {
     clearRoomTimer(room);
     room.timer = setTimeout(() => {
       if (survivors.length <= 1) {
-        room.status = 'FINAL_CHALLENGE';
-        room.finalStage = 'QUESTION';
+        room.finalRound = survivors.length === 1;
+        room.round += 1;
+        room.status = survivors.length === 1 ? 'BOSS_QUESTION' : 'FINAL_CHALLENGE';
+        room.finalStage = survivors.length === 1 ? null : 'COMPLETE';
         room.finalistId = survivors[0]?.id || null;
         room.currentQuestion = '';
         room.finalQuestion = '';
         room.finalDefense = '';
-        room.finalDecision = null;
+        room.finalDecision = survivors.length === 1 ? null : 'reject';
+        room.trapAnswers.clear();
+        room.assignedTraps.clear();
         room.turnEndsAt = null;
+        room.defenseEndsAt = null;
         publishRoom(room);
       } else {
         resetForNextRound(room);
@@ -637,7 +713,7 @@ io.on('connection', (socket) => {
       socket.data.roomId = null;
       publishRoom(room);
       if (room.status === 'SUBMIT_TRAPS') tryStartDefense(room);
-      if (room.status === 'DEFENSE' && departingPlayer?.id === room.defenseOrder[room.turnIndex]) {
+      if (['DEFENSE', 'DEFENSE_ENDING'].includes(room.status) && departingPlayer?.id === room.defenseOrder[room.turnIndex]) {
         advanceDefense(room);
       }
       if (!room.bossConnected && connectedPlayers(room).length === 0) scheduleCleanup(room);
@@ -658,7 +734,7 @@ io.on('connection', (socket) => {
     publishRoom(room);
 
     if (room.status === 'SUBMIT_TRAPS') tryStartDefense(room);
-    if (room.status === 'DEFENSE' && room.defenseOrder[room.turnIndex] === getPlayerBySocket(room, socket.id)?.id) {
+    if (['DEFENSE', 'DEFENSE_ENDING'].includes(room.status) && room.defenseOrder[room.turnIndex] === getPlayerBySocket(room, socket.id)?.id) {
       advanceDefense(room);
     }
     if (!room.bossConnected && connectedPlayers(room).length === 0) scheduleCleanup(room);

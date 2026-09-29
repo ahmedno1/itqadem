@@ -5,12 +5,15 @@
     return {
       bossName: '',
       players: [],
+      originalPlayerCount: 0,
       currentRound: 1,
       currentQuestion: '',
       turnIndex: 0,
       phase: 'menu',
       currentPlayerIndex: 0,
       defenseQueue: [],
+      trapWriterQueue: [],
+      finalRound: false,
       finalDefenseText: '',
       countdown: 60,
       finalWinner: '',
@@ -33,6 +36,7 @@
         ...parsed,
         players: Array.isArray(parsed.players) ? parsed.players : [],
         defenseQueue: Array.isArray(parsed.defenseQueue) ? parsed.defenseQueue : [],
+        trapWriterQueue: Array.isArray(parsed.trapWriterQueue) ? parsed.trapWriterQueue : [],
         timerId: null
       };
       if (!Number.isFinite(state.countdown) || state.countdown < 0 || state.countdown > 60) state.countdown = 60;
