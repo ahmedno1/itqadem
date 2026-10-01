@@ -1,0 +1,19 @@
+export function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/\"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
+export function createUI(app) {
+  return {
+    render(markup) {
+      app.innerHTML = markup;
+    },
+    getElement(id) {
+      return document.getElementById(id);
+    }
+  };
+}
